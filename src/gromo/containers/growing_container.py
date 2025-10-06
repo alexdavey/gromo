@@ -1,7 +1,7 @@
 import torch
 
 from gromo.config.loader import load_config
-from gromo.modules.growing_module import GrowingModule, MergeGrowingModule
+from gromo.modules.growing_module import GrowingModule
 from gromo.utils.utils import get_correct_device
 
 
@@ -19,9 +19,7 @@ class GrowingContainer(torch.nn.Module):
         self.in_features = in_features
         self.out_features = out_features
 
-        self._growing_layers: list[
-            "GrowingModule | MergeGrowingModule | GrowingContainer"
-        ] = list()
+        self._growing_layers: list["GrowingModule | GrowingContainer"] = list()
         self.currently_updated_layer_index = None
 
     def set_growing_layers(self) -> None:
@@ -116,7 +114,7 @@ class GrowingContainer(torch.nn.Module):
     @property
     def currently_updated_layer(
         self,
-    ) -> "GrowingModule | MergeGrowingModule | GrowingContainer":
+    ) -> "GrowingModule | GrowingContainer":
         """Get the currently updated layer"""
         assert self.currently_updated_layer_index is not None, "No layer to update"
         return self._growing_layers[self.currently_updated_layer_index]
@@ -142,5 +140,5 @@ class GrowingContainer(torch.nn.Module):
     def update_size(self) -> None:
         """Update sizes of the individual modules"""
         for layer in self._growing_layers:
-            if isinstance(layer, (MergeGrowingModule, GrowingContainer)):
+            if isinstance(layer, GrowingContainer):
                 layer.update_size()

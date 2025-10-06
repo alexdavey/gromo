@@ -2,243 +2,12 @@ from warnings import warn
 
 import torch
 
-from gromo.modules.growing_module import GrowingModule, MergeGrowingModule
+from gromo.modules.growing_module import GrowingModule
 from gromo.utils.tensor_statistic import TensorStatistic
-from gromo.utils.utils import global_device
 
 
 # Constants for gradient computation
 GRADIENT_COMPUTATION_EPSILON = 1e-5  # Small perturbation for gradient computation
-
-
-class LinearMergeGrowingModule(MergeGrowingModule):
-    def __init__(
-        self,
-        post_merge_function: torch.nn.Module = torch.nn.Identity(),
-        previous_modules=None,
-        next_modules=None,
-        allow_growing: bool = False,
-        in_features: int = None,
-        device: torch.device | None = None,
-        name: str = None,
-    ) -> None:
-        self.use_bias = True
-        self.total_in_features: int = -1
-        self.in_features = in_features
-        # TODO: check if we can automatically get the input shape
-        super(LinearMergeGrowingModule, self).__init__(
-            post_merge_function=post_merge_function,
-            previous_modules=previous_modules,
-            next_modules=next_modules,
-            allow_growing=allow_growing,
-            tensor_s_shape=(
-                in_features + self.use_bias,
-                in_features + self.use_bias,
-            ),  # FIXME: +1 for the bias
-            device=device,
-            name=name,
-        )
-
-    @property
-    def out_features(self) -> int:
-        return self.in_features
-
-    @property
-    def input_volume(self) -> int:
-        return self.in_features
-
-    @property
-    def output_volume(self) -> int:
-        return self.in_features
-
-    def set_next_modules(
-        self, next_modules: list["MergeGrowingModule | GrowingModule"]
-    ) -> None:
-        """
-        Set the next modules of the current module.
-
-        Parameters
-        ----------
-        next_modules
-            list of next modules
-        """
-        if self.tensor_s is not None and self.tensor_s.samples > 0:
-            warn(
-                f"You are setting the next modules of {self.name} with a non-empty tensor S."
-            )
-        self.next_modules = next_modules if next_modules else []
-        # self.use_bias = any(module.use_bias for module in self.next_modules)
-        assert all(
-            modules.in_features == self.out_features for modules in self.next_modules
-        ), f"The output features must match the input features of the next modules."
-
-    def set_previous_modules(
-        self, previous_modules: list["MergeGrowingModule | GrowingModule"]
-    ) -> None:
-        """
-        Set the previous modules of the current module.
-
-        Parameters
-        ----------
-        previous_modules
-            list of previous modules
-        """
-        if self.previous_tensor_s is not None and self.previous_tensor_s.samples > 0:
-            warn(
-                f"You are setting the previous modules of {self.name} with a non-empty previous tensor S."
-            )
-        if self.previous_tensor_m is not None and self.previous_tensor_m.samples > 0:
-            warn(
-                f"You are setting the previous modules of {self.name} with a non-empty previous tensor M."
-            )
-
-        self.previous_modules = previous_modules if previous_modules else []
-        self.total_in_features = 0
-        for module in self.previous_modules:
-            if not isinstance(module, (LinearGrowingModule, MergeGrowingModule)):
-                raise TypeError(
-                    "The previous modules must be LinearGrowingModule instances or MergeGrowingModule)."
-                )
-            if module.output_volume != self.in_features:
-                raise ValueError(
-                    "The input features must match the output volume of the previous modules."
-                )
-            if isinstance(module, LinearGrowingModule):
-                self.total_in_features += module.in_features
-                self.total_in_features += module.use_bias
-        if self.total_in_features > 0:
-            self.previous_tensor_s = TensorStatistic(
-                (
-                    self.total_in_features,
-                    self.total_in_features,
-                ),
-                device=self.device,
-                name=f"S[-1]({self.name})",
-                update_function=self.compute_previous_s_update,
-            )
-        else:
-            self.previous_tensor_s = None
-
-        if self.total_in_features > 0:
-            self.previous_tensor_m = TensorStatistic(
-                (self.total_in_features, self.in_features),
-                device=self.device,
-                name=f"M[-1]({self.name})",
-                update_function=self.compute_previous_m_update,
-            )
-        else:
-            self.previous_tensor_m = None
-
-    def construct_full_activity(self):
-        """
-        Construct the full activity tensor B from the input of all previous modules.
-        B = (B_1, B_2, ..., B_k) in (n, C1 + C2 + ... + Ck) with Ck the number
-        of features of the k-th module.
-        With B_i = (X_i, 1) in (n, C_i' + 1) if the bias is used.
-
-        Returns
-        -------
-        torch.Tensor
-            full activity tensor
-        """
-        # TODO: optimize the construction of the full activity tensor
-        # the merge module should directly store the full activity tensor
-        # and not access it in the previous modules
-        assert self.previous_modules, f"No previous modules for {self.name}."
-        full_activity = torch.ones(
-            (self.previous_modules[0].input.shape[0], self.total_in_features),
-            device=self.device,
-        )
-        current_index = 0
-        for (
-            module
-        ) in self.previous_modules:  # FIXME: what if a previous module is a merge
-            if isinstance(module, MergeGrowingModule):
-                continue
-                # module_input = torch.flatten(module.construct_full_activity(), 1)
-            module_input = torch.flatten(module.input, 1)
-            module_features = module_input.shape[1]
-            full_activity[:, current_index : current_index + module_features] = (
-                module_input
-            )
-            current_index += module_features + int(module.use_bias)
-        return full_activity
-
-    def compute_previous_s_update(self) -> tuple[torch.Tensor, int]:
-        """
-        Compute the update of the tensor S for the input of all previous modules.
-        B: full activity tensor
-        S = B^T B
-
-        Returns
-        -------
-        torch.Tensor
-            update of the tensor S
-        int
-            number of samples used to compute the update
-        """
-        full_activity = self.construct_full_activity()
-        return (
-            torch.einsum("ij,ik->jk", full_activity, full_activity),
-            full_activity.shape[0],
-        )
-
-    def compute_previous_m_update(self) -> tuple[torch.Tensor, int]:
-        """
-        Compute the update of the tensor M for the input of all previous modules.
-        B: full activity tensor
-        M = dLoss/dA^T B
-
-        Returns
-        -------
-        torch.Tensor
-            update of the tensor M
-        int
-            number of samples used to compute the update
-        """
-        # assert self.input.grad is not None, f"No gradient for input for {self.name}."
-        # assert self.pre_activity.grad is not None, f"No gradient for pre_activity for {self.name}."
-        full_activity = self.construct_full_activity()
-        return (
-            torch.einsum("ij,ik->jk", full_activity, self.pre_activity.grad),
-            self.input.shape[0],
-        )
-
-    def compute_s_update(self):
-        """
-        Compute the update of the tensor S.
-        With the input tensor X, the update is U^{j k} = X^{i j} X^{i k}.
-
-        Returns
-        -------
-        torch.Tensor
-            update of the tensor S
-        """
-        assert (
-            self.store_activity
-        ), f"The input must be stored to compute the update of S. (error in {self.name})"
-        assert (
-            self.activity is not None
-        ), f"The input must be stored to compute the update of S. (error in {self.name})"
-        if self.use_bias:
-            # TODO: optimize this : either store directly the extended input or
-            #  do manually the computation B^T B = (X^T X & mean(X)^T\\ mean(X) n)
-            input_extended = torch.cat(
-                (
-                    self.activity,
-                    torch.ones(self.activity.shape[0], 1, device=self.device),
-                ),
-                dim=1,
-            )
-            return (
-                torch.einsum("ij,ik->jk", input_extended, input_extended),
-                self.activity.shape[0],
-            )
-        else:
-            return (
-                torch.einsum("ij,ik->jk", self.activity, self.activity),
-                self.activity.shape[0],
-            )
 
 
 class LinearGrowingModule(GrowingModule):
@@ -249,8 +18,8 @@ class LinearGrowingModule(GrowingModule):
         use_bias: bool = True,
         post_layer_function: torch.nn.Module = torch.nn.Identity(),
         extended_post_layer_function: torch.nn.Module | None = None,
-        previous_module: GrowingModule | MergeGrowingModule | None = None,
-        next_module: GrowingModule | MergeGrowingModule | None = None,
+        previous_module: GrowingModule | None = None,
+        next_module: GrowingModule | None = None,
         allow_growing: bool = False,
         device: torch.device | None = None,
         name: str | None = None,
@@ -286,10 +55,6 @@ class LinearGrowingModule(GrowingModule):
         """
         if isinstance(self.previous_module, GrowingModule):
             return torch.func.grad(self.previous_module.post_layer_function)(
-                torch.tensor(GRADIENT_COMPUTATION_EPSILON, device=self.device)
-            )
-        elif isinstance(self.previous_module, MergeGrowingModule):
-            return torch.func.grad(self.previous_module.post_merge_function)(
                 torch.tensor(GRADIENT_COMPUTATION_EPSILON, device=self.device)
             )
         else:
@@ -437,17 +202,6 @@ class LinearGrowingModule(GrowingModule):
                 ),
                 desired_activation.size(0),
             )
-        elif isinstance(self.previous_module, LinearMergeGrowingModule):
-            if self.previous_module.number_of_successors > 1:
-                warn("The previous module has multiple successors.")
-            return (
-                torch.einsum(
-                    "ij,ik->jk",
-                    self.previous_module.construct_full_activity(),
-                    desired_activation,
-                ),
-                desired_activation.size(0),
-            )
         else:
             raise NotImplementedError(
                 f"The computation of M_{-2} is not implemented yet "
@@ -475,15 +229,6 @@ class LinearGrowingModule(GrowingModule):
                     "ij,ik->jk",
                     torch.flatten(self.previous_module.input_extended, 0, -2),
                     torch.flatten(self.input_extended, 0, -2),
-                ),
-                self.input.shape[0],
-            )
-        elif isinstance(self.previous_module, LinearMergeGrowingModule):
-            return (
-                torch.einsum(
-                    "ij,ik->jk",
-                    self.previous_module.construct_full_activity(),
-                    self.input,
                 ),
                 self.input.shape[0],
             )
@@ -798,8 +543,6 @@ class LinearGrowingModule(GrowingModule):
         if sub_select_previous:
             if isinstance(self.previous_module, LinearGrowingModule):
                 self.previous_module._sub_select_added_output_dimension(keep_neurons)
-            elif isinstance(self.previous_module, LinearMergeGrowingModule):
-                raise NotImplementedError
             else:
                 raise NotImplementedError(
                     f"The computation of the optimal added parameters is not implemented "
@@ -883,8 +626,6 @@ class LinearGrowingModule(GrowingModule):
                 self.previous_module.extended_output_layer = (
                     self.previous_module.layer_of_tensor(alpha_weight, alpha_bias)
                 )
-            elif isinstance(self.previous_module, LinearMergeGrowingModule):
-                raise NotImplementedError
             else:
                 raise NotImplementedError(
                     f"The computation of the optimal added parameters is not implemented "

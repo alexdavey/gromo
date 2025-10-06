@@ -10,496 +10,6 @@ from gromo.utils.tools import compute_optimal_added_parameters, optimal_delta
 from gromo.utils.utils import get_correct_device
 
 
-class MergeGrowingModule(torch.nn.Module):
-    """
-    Module to connect multiple modules with an merge operation.
-    This module does not perform the merge operation, it is done by the user.
-    """
-
-    def __init__(
-        self,
-        post_merge_function: torch.nn.Module = torch.nn.Identity(),
-        previous_modules: list["MergeGrowingModule | GrowingModule"] | None = None,
-        next_modules: list["MergeGrowingModule | GrowingModule"] | None = None,
-        allow_growing: bool = False,
-        tensor_s_shape: tuple[int, int] | None = None,
-        device: torch.device | None = None,
-        name: str | None = None,
-    ) -> None:
-
-        super(MergeGrowingModule, self).__init__()
-        self._name = name
-        self.name = (
-            self.__class__.__name__
-            if name is None
-            else f"{self.__class__.__name__}({name})"
-        )
-        self._config_data, _ = load_config()
-        self.device = get_correct_device(self, device)
-
-        self.post_merge_function: torch.nn.Module = post_merge_function
-        if self.post_merge_function:
-            self.post_merge_function = self.post_merge_function.to(self.device)
-        self._allow_growing = allow_growing
-
-        self.store_input = 0
-        self.input = None
-
-        self.store_activity = 0
-        self.activity = None
-
-        self.tensor_s = TensorStatistic(
-            tensor_s_shape,
-            update_function=self.compute_s_update,
-            device=self.device,
-            name=f"S({self.name})",
-        )
-
-        self.previous_tensor_s: TensorStatistic | None = None
-        self.previous_tensor_m: TensorStatistic | None = None
-
-        self.previous_modules: list[MergeGrowingModule | GrowingModule] = []
-        self.set_previous_modules(previous_modules)
-        self.next_modules: list[MergeGrowingModule | GrowingModule] = []
-        self.set_next_modules(next_modules)
-
-    @property
-    def input_volume(self) -> int:
-        raise NotImplementedError
-
-    @property
-    def output_volume(self) -> int:
-        raise NotImplementedError
-
-    @property
-    def number_of_successors(self):
-        return len(self.next_modules)
-
-    @property
-    def number_of_predecessors(self):
-        return len(self.previous_modules)
-
-    def grow(self):
-        """
-        Function to call after growing previous or next modules.
-        """
-        # mainly used to reset the shape of the tensor S, M, prev S and prev M
-        self.set_next_modules(self.next_modules)
-        self.set_previous_modules(self.previous_modules)
-
-    def add_next_module(self, module: "MergeGrowingModule | GrowingModule") -> None:
-        """
-        Add a module to the next modules of the current module.
-
-        Parameters
-        ----------
-        module
-            next module to add
-        """
-        self.next_modules.append(module)
-        self.set_next_modules(
-            self.next_modules
-        )  # TODO: maybe it is possible to avoid this
-
-    def add_previous_module(self, module: "MergeGrowingModule | GrowingModule") -> None:
-        """
-        Add a module to the previous modules of the current module.
-
-        Parameters
-        ----------
-        module
-            previous module to add
-        """
-        self.previous_modules.append(module)
-        self.set_previous_modules(self.previous_modules)
-
-    def set_next_modules(
-        self, next_modules: list["MergeGrowingModule | GrowingModule"]
-    ) -> None:
-        """
-        Set the next modules of the current module.
-
-        Parameters
-        ----------
-        next_modules
-            list of next modules
-        """
-        raise NotImplementedError
-
-    def set_previous_modules(
-        self, previous_modules: list["MergeGrowingModule | GrowingModule"]
-    ) -> None:
-        """
-        Set the previous modules of the current module.
-
-        Parameters
-        ----------
-        previous_modules
-            list of previous modules
-        """
-        raise NotImplementedError
-
-    def __str__(self, verbose=1):
-        if verbose == 0:
-            return f"{self.__class__.__name__} module."
-        elif verbose == 1:
-            previous_modules = (
-                len(self.previous_modules) if self.previous_modules else "no"
-            )
-            next_modules = len(self.next_modules) if self.next_modules else "no"
-            return (
-                f"{self.__class__.__name__} module with {previous_modules} "
-                f"previous modules and {next_modules} next modules."
-            )
-        elif verbose >= 2:
-            txt = [
-                f"{self.__class__.__name__} module.",
-                f"\tPrevious modules : {self.previous_modules}",
-                f"\tNext modules : {self.next_modules}",
-                f"\tPost merge function : {self.post_merge_function}",
-                f"\tAllow growing : {self._allow_growing}",
-                f"\tStore input : {self.store_input}",
-                f"\tStore activity : {self.store_activity}",
-                f"\tTensor S : {self.tensor_s}",
-                f"\tPrevious tensor S : {self.previous_tensor_s}",
-                f"\tPrevious tensor M : {self.previous_tensor_m}",
-            ]
-            return "\n".join(txt)
-        else:
-            raise ValueError(f"verbose={verbose} is not a valid value.")
-
-    def __repr__(self, *args, **kwargs):
-        return self.__str__(*args, **kwargs)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        for t in (self.tensor_s, self.previous_tensor_s, self.previous_tensor_m):
-            if t:
-                t.updated = False
-
-        if self.store_input > 0:
-            self.input = x
-            self.input.retain_grad()
-
-        if self.post_merge_function and (x is not None):
-            y = self.post_merge_function(x)
-        else:
-            y = x
-
-        if self.store_activity > 0:
-            self.activity = y.detach()
-            self.tensor_s.updated = False  # reset the update flag
-
-        return y
-
-    @property
-    def pre_activity(self):
-        return self.input
-
-    def projected_v_goal(self) -> torch.Tensor:
-        """
-        Compute the projected gradient of the goal with respect to the activity of the layer.
-
-        dLoss/dA_proj := dLoss/dA - dW B[-1] where A is the pre-activation vector of the
-        layer, and dW the optimal delta for all the previous layers
-
-        Returns
-        -------
-        torch.Tensor
-            projected gradient of the goal with respect to the activity of the next layer
-            dLoss/dA - dW B[-1]
-        """
-        v_proj = self.pre_activity.grad.clone().detach()
-        for module in self.previous_modules:
-            v_proj -= module.optimal_delta_layer(module.input)
-
-        return v_proj
-
-    def compute_s_update(self) -> tuple[torch.Tensor, int]:
-        """
-        Compute the update of the tensor S. Should be added to the type of layer.
-
-        Returns
-        -------
-        torch.Tensor
-            update of the tensor S
-        int
-            number of samples used to compute the update
-        """
-        raise NotImplementedError
-
-    def compute_previous_s_update(self) -> tuple[torch.Tensor, int]:
-        """
-        Compute the update of the tensor S for the input of all previous modules.
-
-        Returns
-        -------
-        torch.Tensor
-            update of the tensor S
-        int
-            number of samples used to compute the update
-        """
-        raise NotImplementedError
-
-    def compute_previous_m_update(self) -> tuple[torch.Tensor, int]:
-        """
-        Compute the update of the tensor M for the input of all previous modules.
-
-        Returns
-        -------
-        torch.Tensor
-            update of the tensor M
-        int
-            number of samples used to compute the update
-        """
-        raise NotImplementedError
-
-    def init_computation(self) -> None:
-        """
-        Initialize the computation of the optimal added parameters.
-        """
-        self.store_input = True
-        self.store_activity = True
-        self.tensor_s.init()
-        for module in self.previous_modules:
-            module.store_input = True
-            module.store_pre_activity = True
-        if self.previous_tensor_s is not None:
-            self.previous_tensor_s.init()
-        if self.previous_tensor_m is not None:
-            self.previous_tensor_m.init()
-
-    def update_computation(self) -> None:
-        """
-        Update the computation of the optimal added parameters.
-        """
-        self.tensor_s.update()
-        if self.previous_tensor_s is not None:
-            self.previous_tensor_s.update()
-        if self.previous_tensor_m is not None:
-            self.previous_tensor_m.update()
-
-    def reset_computation(self) -> None:
-        """
-        Reset the computation of the optimal added parameters.
-        """
-        self.store_input = False
-        self.store_activity = False
-        self.tensor_s.reset()
-        for module in self.previous_modules:
-            module.store_input = False
-            module.store_pre_activity = False
-        if self.previous_tensor_s is not None:
-            self.previous_tensor_s.reset()
-        if self.previous_tensor_m is not None:
-            self.previous_tensor_m.reset()
-
-    def delete_update(self, include_previous: bool = False) -> None:
-        """
-        Delete the update of the optimal added parameters.
-        """
-        self.optimal_delta_layer = None
-        self.extended_input_layer = None
-        self.parameter_update_decrease = None
-        self.eigenvalues_extension = None
-        self.activity = None
-        self.input = None
-
-        if include_previous:
-            for previous_module in self.previous_modules:
-                if isinstance(previous_module, GrowingModule):
-                    previous_module.delete_update(
-                        include_previous=False, include_output=True
-                    )
-
-    def compute_optimal_delta(
-        self,
-        update: bool = True,
-        return_deltas: bool = False,
-        force_pseudo_inverse: bool = False,
-        dtype: torch.dtype = torch.float32,
-    ) -> list[tuple[torch.Tensor, torch.Tensor]] | None:
-        """
-        Compute the optimal delta for each previous layer using current S and M tensors.
-        dW* = M S[-1]^-1 (if needed we use the pseudo-inverse)
-        Compute dW* (and dBias* if needed) and update the optimal_delta_layer attribute.
-        Parameters
-        ----------
-        update: bool, default True
-            if True update the optimal delta layer attribute
-        return_deltas: bool, default False
-            if True return the deltas
-        force_pseudo_inverse: bool, default False
-            if True, use the pseudo-inverse to compute the optimal delta even if the
-            matrix is invertible
-        dtype: torch.dtype
-            dtype for S and M during the computation
-        Returns
-        -------
-        list[tuple[torch.Tensor, torch.Tensor]] | None
-            optimal delta for the weights and the biases if needed
-        """
-        assert (
-            self.previous_tensor_s is not None
-        ), f"No previous tensor S for {self.name}."
-        assert (
-            self.previous_tensor_m is not None
-        ), f"No previous tensor M for {self.name}."
-        previous_tensor_s = self.previous_tensor_s()
-        previous_tensor_m = self.previous_tensor_m()
-        assert previous_tensor_s.shape[0] == self.total_in_features, (
-            f"The inverse of S should have the same number of features as the input "
-            f"of all previous modules. Expected {self.total_in_features}. Got {previous_tensor_s.shape[0]}."
-        )
-        assert previous_tensor_m.shape == (self.total_in_features, self.in_features), (
-            f"The tensor M should have shape ({self.total_in_features}, {self.in_features}). "
-            f"Got {previous_tensor_m.shape}."
-        )
-        delta, _ = optimal_delta(
-            previous_tensor_s,
-            previous_tensor_m,
-            dtype=dtype,
-            force_pseudo_inverse=force_pseudo_inverse,
-        )
-
-        deltas = []
-        current_index = 0
-        for module in self.previous_modules:
-            if isinstance(module, MergeGrowingModule):
-                continue
-            delta_w = delta[:, current_index : current_index + module.in_features]
-            if module.use_bias:
-                delta_b = delta[:, current_index + module.in_features]
-            else:
-                delta_b = None
-
-            # change the shape of the delta_w and delta_b to match the layer
-            delta_w = delta_w.reshape(*module.weight.shape)
-            if update:
-                module.optimal_delta_layer = module.layer_of_tensor(delta_w, delta_b)
-            # elif isinstance(module, MergeGrowingModule):
-            #     if update:
-            #         if module.post_merge_function.is_non_linear():
-            #             warnings.warn(
-            #                 f"The previous module {module.name} is a MergeGrowingModule with a non-linear post merge function. "
-            #                 f"The optimal delta may not be accurate.",
-            #                 UserWarning,
-            #             )
-            #         else:
-            #             module.set_optimal_delta_layers(delta_w, delta_b)
-
-            if return_deltas:
-                deltas.append((delta_w, delta_b))
-
-            current_index += module.in_features + module.use_bias
-
-        if return_deltas:
-            return deltas
-        else:
-            return None
-
-    def update_size(self) -> None:
-        """
-        Update the input and output size of the module
-        """
-        if len(self.previous_modules) > 0:
-            new_size = self.previous_modules[0].out_features
-            self.in_features = new_size
-        self.total_in_features = self.sum_in_features(with_bias=True)
-
-        if self.total_in_features > 0:
-            if self.previous_tensor_s._shape != (
-                self.total_in_features,
-                self.total_in_features,
-            ):
-                self.previous_tensor_s = TensorStatistic(
-                    (
-                        self.total_in_features,
-                        self.total_in_features,
-                    ),
-                    device=self.device,
-                    name=f"S[-1]({self.name})",
-                    update_function=self.compute_previous_s_update,
-                )
-            if self.previous_tensor_m._shape != (
-                self.total_in_features,
-                self.in_features,
-            ):
-                self.previous_tensor_m = TensorStatistic(
-                    (self.total_in_features, self.in_features),
-                    device=self.device,
-                    name=f"M[-1]({self.name})",
-                    update_function=self.compute_previous_m_update,
-                )
-        else:
-            self.previous_tensor_s = None
-            self.previous_tensor_m = None
-
-    @property
-    def number_of_parameters(self):
-        return 0
-
-    def parameters(self, recurse: bool = True) -> Iterator[torch.nn.Parameter]:
-        return iter([])
-
-    def sum_in_features(self, with_bias: bool = False) -> int:
-        """Count total in_features of previous modules
-
-        Returns
-        -------
-        int
-            sum of previous in_features
-        """
-        if with_bias:
-            return sum(
-                module.in_features + module.use_bias
-                for module in self.previous_modules
-                if not isinstance(module, MergeGrowingModule)
-            )
-        return sum(
-            module.in_features
-            for module in self.previous_modules
-            if not isinstance(module, MergeGrowingModule)
-        )
-
-    def sum_out_features(self) -> int:
-        """Count total out_features of next modules
-
-        Returns
-        -------
-        int
-            sum of next out_features
-        """
-        return np.sum([module.out_features for module in self.next_modules])
-
-    def update_scaling_factor(self, scaling_factor: torch.Tensor | float) -> None:
-        """
-        Update the scaling factor of all next modules and
-        the _next_module_scaling_factor of the previous modules.
-        Does only work if previous and next modules are GrowingModule.
-
-        Parameters
-        ----------
-        scaling_factor: torch.Tensor | float
-            scaling factor to apply to the optimal delta
-        """
-        if isinstance(scaling_factor, torch.Tensor):
-            scaling_factor = scaling_factor.item()
-        for module in self.previous_modules:
-            if isinstance(module, GrowingModule):
-                module._scaling_factor_next_module.data[0] = scaling_factor
-            else:
-                raise TypeError(
-                    f"Previous module must be a GrowingModule, got {type(module)}"
-                )
-        for module in self.next_modules:
-            if isinstance(module, GrowingModule):
-                module.__dict__["scaling_factor"].data[0] = scaling_factor
-            else:
-                raise TypeError(
-                    f"Next module must be a GrowingModule, got {type(module)}"
-                )
-
-
 class GrowingModule(torch.nn.Module):
     def __init__(
         self,
@@ -586,11 +96,9 @@ class GrowingModule(torch.nn.Module):
             )
 
         self._allow_growing = allow_growing
-        assert not self._allow_growing or isinstance(
-            previous_module, (GrowingModule, MergeGrowingModule)
-        ), (
+        assert not self._allow_growing or isinstance(previous_module, (GrowingModule)), (
             f"to grow previous_module must be an instance of GrowingModule"
-            f"or MergeGrowingModule, but got {type(previous_module)}"
+            f", but got {type(previous_module)}"
         )
 
         self.next_module: torch.nn.Module | None = next_module
@@ -751,19 +259,10 @@ class GrowingModule(torch.nn.Module):
     def __setattr__(self, key, value):
         if key == "store_input" and value is not self.store_input:
             self.__dict__["store_input"] = value
-            if isinstance(self.previous_module, MergeGrowingModule):
-                # As a MergeGrowingModule may have multiple next modules
-                # we need to keep track of the number of modules that require the activity
-                # to be stored. Hence we store it as long as one of the module requires it.
-                self.previous_module.store_activity += 1 if value else -1
-            else:
-                self._internal_store_input = value
+            self._internal_store_input = value
         elif key == "store_pre_activity" and value is not self.store_pre_activity:
             self.__dict__["store_pre_activity"] = value
-            if isinstance(self.next_module, MergeGrowingModule):
-                self.next_module.store_input += 1 if value else -1
-            else:
-                self._internal_store_pre_activity = value
+            self._internal_store_pre_activity = value
         elif key == "previous_module" or key == "next_module":
             self.__dict__[key] = value
         elif key == "scaling_factor":
@@ -782,12 +281,9 @@ class GrowingModule(torch.nn.Module):
                 self.previous_module._scaling_factor_next_module.data[0] = (
                     self.scaling_factor.item()
                 )
-            elif isinstance(self.previous_module, MergeGrowingModule):
-                # self.previous_module.update_scaling_factor(self.scaling_factor)
-                pass
             else:
                 raise TypeError(
-                    f"Previous module must be a GrowingModule or MergeGrowingModule, got {type(self.previous_module)}"
+                    f"Previous module must be a GrowingModule, got {type(self.previous_module)}"
                 )
         elif key == "weight":
             self.layer.weight = value
@@ -1037,10 +533,7 @@ class GrowingModule(torch.nn.Module):
         TensorStatistic
             tensor S
         """
-        if isinstance(self.previous_module, MergeGrowingModule):
-            return self.previous_module.tensor_s
-        else:
-            return self._tensor_s
+        return self._tensor_s
 
     @property
     def tensor_s_growth(self):
@@ -1053,11 +546,6 @@ class GrowingModule(torch.nn.Module):
             )
         elif isinstance(self.previous_module, GrowingModule):
             return self.previous_module.tensor_s
-        elif isinstance(self.previous_module, MergeGrowingModule):
-            raise NotImplementedError(
-                f"S growth is not implemented for module preceded by an MergeGrowingModule."
-                f" (error in {self.name})"
-            )
         else:
             raise NotImplementedError(
                 f"S growth is not implemented yet for {type(self.previous_module)} as previous module."
@@ -1385,16 +873,8 @@ class GrowingModule(torch.nn.Module):
                         scaling_factor=self.scaling_factor,
                         extension_size=extension_size,
                     )
-                elif isinstance(self.previous_module, MergeGrowingModule):
-                    raise NotImplementedError  # TODO
                 else:
                     raise NotImplementedError
-
-            # Update the size of the previous and next modules
-            if isinstance(self.previous_module, MergeGrowingModule):
-                self.previous_module.update_size()
-            if isinstance(self.next_module, MergeGrowingModule):
-                self.next_module.update_size()
 
     # Optimal update computation
     def compute_optimal_delta(
@@ -1611,8 +1091,6 @@ class GrowingModule(torch.nn.Module):
                 use_projected_gradient=use_projected_gradient,
             )
             return alpha_weight, alpha_bias
-        elif isinstance(self.previous_module, MergeGrowingModule):
-            raise NotImplementedError  # TODO
         else:
             raise NotImplementedError
 
@@ -1631,8 +1109,6 @@ class GrowingModule(torch.nn.Module):
             self.tensor_m_prev.init()
             self.cross_covariance.init()
             self.tensor_s_growth.init()
-        elif isinstance(self.previous_module, MergeGrowingModule):
-            self.previous_module.init_computation()
         else:
             raise NotImplementedError
 
@@ -1648,8 +1124,6 @@ class GrowingModule(torch.nn.Module):
             self.tensor_m_prev.update()
             self.cross_covariance.update()
             self.tensor_s_growth.update()
-        elif isinstance(self.previous_module, MergeGrowingModule):
-            self.previous_module.update_computation()
         else:
             raise NotImplementedError
 
@@ -1667,8 +1141,6 @@ class GrowingModule(torch.nn.Module):
             self.tensor_m_prev.reset()
             self.cross_covariance.reset()
             self.tensor_s_growth.reset()
-        elif isinstance(self.previous_module, MergeGrowingModule):
-            self.previous_module.reset_computation()
         else:
             raise NotImplementedError
 
@@ -1714,21 +1186,10 @@ class GrowingModule(torch.nn.Module):
                 if include_previous:
                     if isinstance(self.previous_module, GrowingModule):
                         self.previous_module.extended_output_layer = None
-                    elif isinstance(self.previous_module, MergeGrowingModule):
-                        raise NotImplementedError  # TODO
-                        # two options for future implementation:
-                        # 1. Do nothing(ie replace raise NotImplementedError by return or
-                        # a warning) and let the user fully in charge of deleting the
-                        # associated extensions.
-                        # 2. Delete associated extension ie all previous extended output,
-                        # all parallel extended input and maybe more as we could have
-                        # skip connections...
-
                     else:
                         raise TypeError(
                             f"Unexpected type for previous_module of {self.name}"
                             f"got {type(self.previous_module)} instead of GrowingModule "
-                            f"or MergeGrowingModule."
                         )
                 # risky behavior
                 else:  # include_previous is False
@@ -1743,17 +1204,10 @@ class GrowingModule(torch.nn.Module):
                                 UserWarning,
                             )
                         # otherwise it is ok as user already deleted the extended_output_layer
-                    elif isinstance(self.previous_module, MergeGrowingModule):
-                        return
-                        # the user intentionally decided to take care of deletion of the
-                        # other extensions we do not raise a warning (in contrast with the
-                        # GrowingModule case) as  this is way more likely to happen
-                        # with MergeGrowingModule
                     else:
                         raise TypeError(
                             f"Unexpected type for previous_module of {self.name}"
                             f"got {type(self.previous_module)} instead of GrowingModule "
-                            f"or MergeGrowingModule."
                         )
             # incorrect behavior
             else:  # self.previous_module is None
