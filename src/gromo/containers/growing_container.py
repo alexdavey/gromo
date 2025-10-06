@@ -1,6 +1,5 @@
 import torch
 
-from gromo.config.loader import load_config
 from gromo.modules.growing_module import GrowingModule
 from gromo.utils.utils import get_correct_device
 
@@ -13,7 +12,7 @@ class GrowingContainer(torch.nn.Module):
         device: torch.device | str | None = None,
     ) -> None:
         super(GrowingContainer, self).__init__()
-        self._config_data, _ = load_config()
+        self._config_data = {}
         self.device = get_correct_device(self, device)
 
         self.in_features = in_features

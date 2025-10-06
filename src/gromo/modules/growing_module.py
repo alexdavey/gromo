@@ -4,7 +4,6 @@ from typing import Iterator
 import numpy as np
 import torch
 
-from gromo.config.loader import load_config
 from gromo.utils.tensor_statistic import TensorStatistic
 from gromo.utils.tools import compute_optimal_added_parameters, optimal_delta
 from gromo.utils.utils import get_correct_device
@@ -70,7 +69,7 @@ class GrowingModule(torch.nn.Module):
             if name is None
             else f"{self.__class__.__name__}({name})"
         )
-        self._config_data, _ = load_config()
+        self._config_data = {}
         self.device = get_correct_device(self, device)
 
         self.layer: torch.nn.Module = layer.to(self.device)
