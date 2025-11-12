@@ -1,4 +1,5 @@
 import types
+from typing import Callable, Sequence
 from warnings import warn
 
 import torch
@@ -580,6 +581,126 @@ class LinearGrowingModule(GrowingModule):
             f"{self.name=}, {self.cross_covariance().shape=}"
         )
         return -self.tensor_m_prev() + self.cross_covariance() @ self.delta_raw.T
+
+    # Pruning
+    def prune(
+        self,
+        selector_fn: Callable[[torch.Tensor, torch.Tensor | None], torch.Tensor],
+    ):
+        """
+        Remove neurons selected by the provided boolean mask.
+
+        Parameters
+        ----------
+        selector_fn : Callable[[Tensor, Tensor | None], Tensor]
+            Function receiving the layer weight and bias tensors and returning a
+            boolean mask of shape `(out_features,)`. Entries set to True indicate the
+            corresponding neuron should be pruned.
+        """
+        if not callable(selector_fn):
+            raise TypeError("selector_fn must be callable.")
+
+        mask = selector_fn(
+            self.weight.detach(),
+            self.bias.detach() if self.bias is not None else None,
+        )
+
+        assert isinstance(
+            mask, torch.Tensor
+        ), "selector_fn must return a boolean tensor mask."
+        assert mask.dtype == torch.bool, "selector_fn mask must be of dtype bool."
+        assert mask.shape == (
+            self.out_features,
+        ), f"selector_fn mask must have shape {(self.out_features,)}, got {mask.shape}."
+
+        neuron_indexes = torch.nonzero(mask, as_tuple=False).flatten().tolist()
+        if not neuron_indexes:
+            return
+
+        keep_indexes = [
+            idx for idx in range(self.out_features) if idx not in neuron_indexes
+        ]
+        assert (
+            keep_indexes
+        ), f"Cannot prune all neurons from {self.name}. At least one neuron must remain."
+
+        index_tensor = torch.tensor(
+            keep_indexes,
+            dtype=torch.long,
+            device=self.weight.device,
+        )
+        new_weight = self.weight.detach().index_select(0, index_tensor).clone()
+        new_bias = (
+            self.bias.detach().index_select(0, index_tensor).clone()
+            if self.use_bias
+            else None
+        )
+
+        self.layer = self.layer_of_tensor(new_weight, bias=new_bias)
+        self.layer.forward = types.MethodType(self.__make_safe_forward(), self.layer)
+        self._refresh_statistics_after_shape_change()
+
+        if isinstance(self.next_module, LinearGrowingModule):
+            self.next_module._prune_inputs(neuron_indexes)
+        elif self.next_module is not None:
+            raise NotImplementedError(
+                f"Pruning {self.name} is only supported when its successor is a LinearGrowingModule."
+            )
+
+    def _prune_inputs(self, indexes_to_remove: Sequence[int]) -> None:
+        """Internal helper used by previous layers to drop matching inputs."""
+        normalized_indexes = sorted(
+            {
+                int(idx.item()) if isinstance(idx, torch.Tensor) else int(idx)
+                for idx in indexes_to_remove
+            }
+        )
+        if not normalized_indexes:
+            return
+        assert all(0 <= idx < self.in_features for idx in normalized_indexes), (
+            f"Input pruning indices must be within [0, {self.in_features}). "
+            f"Got {normalized_indexes}"
+        )
+
+        keep_indexes = [
+            idx for idx in range(self.in_features) if idx not in normalized_indexes
+        ]
+        assert keep_indexes, (
+            f"Cannot remove all inputs feeding {self.name}. "
+            "Pruning request is inconsistent with the network topology."
+        )
+
+        index_tensor = torch.tensor(
+            keep_indexes, dtype=torch.long, device=self.weight.device
+        )
+        new_weight = self.weight.detach().index_select(1, index_tensor).clone()
+        new_bias = self.bias.detach().clone() if self.use_bias else None
+
+        self.layer = self.layer_of_tensor(new_weight, bias=new_bias)
+        self.layer.forward = types.MethodType(self.__make_safe_forward(), self.layer)
+        self._refresh_statistics_after_shape_change()
+
+    def _refresh_statistics_after_shape_change(self) -> None:
+        """Reset cached statistics and updates after a structural change."""
+        tensor_s_name = self._tensor_s.name
+        tensor_m_name = self.tensor_m.name
+        self._tensor_s = TensorStatistic(
+            (self.in_features + self.use_bias, self.in_features + self.use_bias),
+            update_function=self.compute_s_update,
+            device=self.device,
+            name=tensor_s_name,
+        )
+        self.tensor_m = TensorStatistic(
+            (self.in_features + self.use_bias, self.out_features),
+            update_function=self.compute_m_update,
+            device=self.device,
+            name=tensor_m_name,
+        )
+        if self.tensor_m_prev is not None:
+            self.tensor_m_prev.reset()
+        if self.cross_covariance is not None:
+            self.cross_covariance.reset()
+        self.delete_update(include_previous=True, delete_output=True)
 
     # Layer edition
     def layer_of_tensor(

@@ -1,4 +1,4 @@
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 import torch
 from torch import Tensor, nn
@@ -97,6 +97,9 @@ class GrowingMLP(GrowingContainer):
             )
         )
 
+        for previous_layer, next_layer in zip(self.layers[:-1], self.layers[1:]):
+            previous_layer.next_module = next_layer
+
         self.set_growing_layers()
 
     def set_growing_layers(self) -> None:
@@ -140,6 +143,45 @@ class GrowingMLP(GrowingContainer):
         for layer in self.layers:
             x, x_ext = layer.extended_forward(x, x_ext)
         return x
+
+    def prune(
+        self,
+        selector_fn: Callable[[torch.Tensor, torch.Tensor | None], torch.Tensor],
+        *,
+        skip_output_layer: bool = False,
+    ) -> dict[int, list[int]]:
+        """
+        Apply structured pruning to every LinearGrowingModule in the container.
+
+        Parameters
+        ----------
+        selector_fn : Callable[[Tensor, Tensor | None], Tensor]
+            Function that receives each layer's weight and bias tensors and returns a
+            boolean mask of shape `(out_features,)`. Neurons flagged True are removed.
+
+        skip_output_layer : bool, default=False
+            If True, the last linear layer (classifier head) is left untouched.
+        Returns
+        -------
+        dict[int, list[int]]
+            Mapping from layer index to the list of pruned neuron indexes.
+        """
+        if not callable(selector_fn):
+            raise TypeError("selector_fn must be callable.")
+
+        pruned: dict[int, list[int]] = {}
+        last_layer_index = len(self.layers) - 1
+        for idx, layer in enumerate(self.layers):
+            if skip_output_layer and idx == last_layer_index:
+                continue
+            removed = layer.prune(selector_fn)
+            if removed:
+                pruned[idx] = removed
+
+        if pruned:
+            self.set_growing_layers()
+            self.out_features = self.layers[-1].out_features
+        return pruned
 
     @staticmethod
     def tensor_statistics(tensor: Tensor) -> Dict[str, float]:

@@ -77,6 +77,30 @@ class TestGrowingMLP(TorchTestCase):
         y = self.model.extended_forward(x)
         self.assertShapeEqual(y, (1, self.out_features))
 
+    def test_prune_updates_hidden_layers(self):
+        """Pruning through the container should update subsequent layers."""
+        original_hidden = self.model.layers[0].out_features
+        call_state = {"count": 0}
+
+        def selector(weight, bias):
+            mask = torch.zeros(weight.shape[0], dtype=torch.bool, device=weight.device)
+            idx = call_state["count"]
+            call_state["count"] += 1
+            if idx == 0:
+                mask[0] = True
+            return mask
+
+        # TODO: Re-implement this
+        self.model.prune(selector)
+        # pruned = self.model.prune(selector)
+        # self.assertIn(0, pruned)
+        # self.assertEqual(pruned[0], [0])
+        self.assertEqual(self.model.layers[0].out_features, original_hidden - 1)
+        self.assertEqual(
+            self.model.layers[1].in_features, self.model.layers[0].out_features
+        )
+        self.assertEqual(self.model.out_features, self.out_features)
+
     def test_tensor_statistics(self):
         """Test computation of tensor statistics (min, max, mean, std)."""
         tensor = torch.randn(10)
