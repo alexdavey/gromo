@@ -1,15 +1,11 @@
 import types
-from typing import Callable, Sequence
+from typing import Callable
 from warnings import warn
 
 import torch
 
 from gromo.modules.growing_module import GrowingModule, MergeGrowingModule
 from gromo.utils.tensor_statistic import TensorStatistic
-
-
-# Constants for gradient computation
-GRADIENT_COMPUTATION_EPSILON = 1e-5  # Small perturbation for gradient computation
 
 
 class LinearMergeGrowingModule(MergeGrowingModule):
@@ -285,30 +281,6 @@ class LinearGrowingModule(GrowingModule):
 
     # Information functions
     @property
-    def activation_gradient(self) -> torch.Tensor:
-        """
-        Return the derivative of the activation function before this layer at 0+.
-
-        Returns
-        -------
-        torch.Tensor
-            derivative of the activation function before this layer at 0+
-        """
-        if isinstance(self.previous_module, GrowingModule):
-            return torch.func.grad(self.previous_module.post_layer_function)(
-                torch.tensor(GRADIENT_COMPUTATION_EPSILON, device=self.device)
-            )
-        elif isinstance(self.previous_module, MergeGrowingModule):
-            return torch.func.grad(self.previous_module.post_merge_function)(
-                torch.tensor(GRADIENT_COMPUTATION_EPSILON, device=self.device)
-            )
-        else:
-            raise NotImplementedError(
-                f"The computation of the activation gradient is not implemented yet "
-                f"for {type(self.previous_module)} as previous module."
-            )
-
-    @property
     def input_extended(self) -> torch.Tensor:
         """
         Return the input extended with a column of ones if the bias is used.
@@ -582,7 +554,6 @@ class LinearGrowingModule(GrowingModule):
         )
         return -self.tensor_m_prev() + self.cross_covariance() @ self.delta_raw.T
 
-    # Pruning
     def prune(
         self,
         selector_fn: Callable[[torch.Tensor, torch.Tensor | None], torch.Tensor],
