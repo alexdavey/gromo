@@ -1404,25 +1404,10 @@ class GrowingModule(torch.nn.Module):
 
     def _refresh_statistics_after_shape_change(self) -> None:
         """Reset cached statistics and updates after a structural change."""
-        tensor_s_name = self._tensor_s.name
-        tensor_m_name = self.tensor_m.name
-        self._tensor_s = TensorStatistic(
-            (self.in_features + self.use_bias, self.in_features + self.use_bias),
-            update_function=self.compute_s_update,
-            device=self.device,
-            name=tensor_s_name,
+        raise NotImplementedError(
+            "_refresh_statistics_after_shape_change must be implemented "
+            "by subclasses to update their statistics after pruning or extensions."
         )
-        self.tensor_m = TensorStatistic(
-            (self.in_features + self.use_bias, self.out_features),
-            update_function=self.compute_m_update,
-            device=self.device,
-            name=tensor_m_name,
-        )
-        if self.tensor_m_prev is not None:
-            self.tensor_m_prev.reset()
-        if self.cross_covariance is not None:
-            self.cross_covariance.reset()
-        self.delete_update(include_previous=True, delete_output=True)
 
     def parameter_step(
         self, delta_weights: torch.Tensor, delta_biases: torch.Tensor | None = None

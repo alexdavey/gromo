@@ -958,6 +958,36 @@ class Conv2dGrowingModule(GrowingModule):
             name=self.tensor_m.name,
         )
 
+    def _refresh_statistics_after_shape_change(self) -> None:
+        """Reinitialize cached statistics after pruning or structural edits."""
+        self._tensor_s = TensorStatistic(
+            (
+                (self.in_channels + self.use_bias)
+                * self.layer.kernel_size[0]
+                * self.layer.kernel_size[1],
+                (self.in_channels + self.use_bias)
+                * self.layer.kernel_size[0]
+                * self.layer.kernel_size[1],
+            ),
+            update_function=self.compute_s_update,
+            name=self.tensor_s.name,
+        )
+        self.tensor_m = TensorStatistic(
+            (
+                (self.in_channels + self.use_bias)
+                * self.layer.kernel_size[0]
+                * self.layer.kernel_size[1],
+                self.out_channels,
+            ),
+            update_function=self.compute_m_update,
+            name=self.tensor_m.name,
+        )
+        if self.tensor_m_prev is not None:
+            self.tensor_m_prev.reset()
+        if self.cross_covariance is not None:
+            self.cross_covariance.reset()
+        self.delete_update(include_previous=True, delete_output=True)
+
     def _sub_select_added_output_dimension(self, keep_neurons: int) -> None:
         """
         Select the first `keep_neurons` neurons of the optimal added output dimension.
