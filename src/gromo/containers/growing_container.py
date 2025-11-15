@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, Callable
 
 import torch
 
@@ -123,6 +123,26 @@ class GrowingContainer(torch.nn.Module):
     def dummy_select_update(self, **_) -> int:
         self.currently_updated_layer_index = 0
         return 0
+
+    def prune(
+        self,
+        selector_fn: Callable[[torch.Tensor, torch.Tensor | None], torch.Tensor],
+    ) -> dict[int, list[int]]:
+        """
+        Apply structured pruning to every growing_layer in the container.
+
+        Parameters
+        ----------
+        selector_fn : Callable[[Tensor, Tensor | None], Tensor]
+            Function that receives each layer's weight and bias tensors and returns a
+            boolean mask of shape `(out_features,)`. Neurons flagged True are removed.
+
+        Returns
+        -------
+        list[list[int]]
+            In-order list of pruned indices, matching `_growing_layers`.
+        """
+        return [layer.prune(selector_fn) for layer in self._growing_layers]
 
     def select_update(self, layer_index: int, verbose: bool = False) -> int:
         self.currently_updated_layer_index = layer_index
