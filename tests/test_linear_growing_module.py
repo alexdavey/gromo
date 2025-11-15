@@ -1472,47 +1472,90 @@ class TestLinearGrowingModule(TestLinearGrowingModuleBase):
 
         self.assertAllClose(z_new, z_origin, atol=1e-5)
 
-    def test_prune_removes_neurons_and_updates_next_layer(self):
-        """Pruning should drop selected neurons and update the successor inputs."""
+    def test_prune_returns_indices_and_updates_parameters(self):
+        """Pruning should return selected indices and shrink parameters/statistics."""
+        layer, _ = self.create_demo_layers(bias=True, hidden_features=5)
+        original_weight = layer.weight.detach().clone()
+        original_bias = layer.bias.detach().clone() if layer.use_bias else None
+
+        mask = torch.zeros(layer.out_features, dtype=torch.bool, device=layer.device)
+        mask[1] = True
+        mask[3] = True
+
+        layer.tensor_m_prev.samples = 4
+        layer.cross_covariance.samples = 6
+
+        def selector(weight, bias):
+            self.assertIs(weight, layer.weight)
+            if bias is not None:
+                self.assertIs(bias, layer.bias)
+            return mask
+
+        pruned = layer.prune(selector)
+        self.assertListEqual(pruned, [1, 3])
+
+        keep_mask = ~mask
+        expected_weight = original_weight[keep_mask]
+        self.assertAllClose(layer.weight.detach(), expected_weight)
+        if original_bias is not None:
+            expected_bias = original_bias[keep_mask]
+            self.assertAllClose(layer.bias.detach(), expected_bias)
+        self.assertEqual(layer.out_features, int(keep_mask.sum().item()))
+
+        input_dim = layer.in_features + int(layer.use_bias)
+        self.assertEqual(layer.tensor_s._shape, (input_dim, input_dim))
+        self.assertEqual(layer.tensor_m._shape, (input_dim, layer.out_features))
+        self.assertEqual(layer.tensor_m_prev.samples, 0)
+        self.assertEqual(layer.cross_covariance.samples, 0)
+
+    def test_prune_noop_returns_empty_list_and_keeps_state(self):
+        """If selector returns all False, nothing should change."""
+        layer, _ = self.create_demo_layers(bias=False, hidden_features=4)
+        original_weight = layer.weight.detach().clone()
+        original_bias = layer.bias.detach().clone() if layer.use_bias else None
+        tensor_s_before = layer.tensor_s
+        tensor_m_before = layer.tensor_m
+
+        def selector(weight, __):
+            return torch.zeros(weight.shape[0], dtype=torch.bool, device=weight.device)
+
+        result = layer.prune(selector)
+        self.assertEqual(result, [])
+        self.assertAllClose(layer.weight.detach(), original_weight)
+        if original_bias is not None:
+            self.assertAllClose(layer.bias.detach(), original_bias)
+        self.assertIs(layer.tensor_s, tensor_s_before)
+        self.assertIs(layer.tensor_m, tensor_m_before)
+
+    def test_prune_propagates_to_next_layer_inputs(self):
+        """Ensure downstream layer drops matching input channels after pruning."""
         layer1, layer2 = self.create_demo_layers(bias=True, hidden_features=5)
         layer1.next_module = layer2
 
         original_first_weight = layer1.weight.detach().clone()
-        original_first_bias = layer1.bias.detach().clone() if layer1.use_bias else None
+        original_first_bias = layer1.bias.detach().clone()
         original_second_weight = layer2.weight.detach().clone()
-        original_second_bias = layer2.bias.detach().clone() if layer2.use_bias else None
 
         mask = torch.zeros(layer1.out_features, dtype=torch.bool, device=layer1.device)
         mask[1] = True
         mask[3] = True
+        keep_indices = torch.tensor(
+            [idx for idx in range(mask.numel()) if not mask[idx]],
+            dtype=torch.long,
+            device=layer1.device,
+        )
 
-        def selector(_, __):
-            return mask
+        pruned = layer1.prune(lambda *_: mask)
+        self.assertListEqual(pruned, [1, 3])
 
-        # TODO: Re-implement this
-        # pruned = layer1.prune(selector)
-        layer1.prune(selector)
-        # self.assertEqual(pruned, [1, 3])
-        # keep_idx = [idx for idx in range(original_first_weight.size(0)) if idx not in pruned]
-        # keep_tensor = torch.tensor(keep_idx, dtype=torch.long, device=layer1.device)
+        expected_weight = original_first_weight.index_select(0, keep_indices)
+        self.assertAllClose(layer1.weight.detach(), expected_weight)
+        expected_bias = original_first_bias.index_select(0, keep_indices)
+        self.assertAllClose(layer1.bias.detach(), expected_bias)
 
-        # expected_weight = original_first_weight.index_select(0, keep_tensor)
-        # self.assertAllClose(layer1.weight.detach(), expected_weight)
-        # if original_first_bias is not None:
-        #     expected_bias = original_first_bias.index_select(0, keep_tensor)
-        #     self.assertAllClose(layer1.bias.detach(), expected_bias)
-
-        # expected_next_weight = original_second_weight.index_select(
-        #     1, keep_tensor.to(device=original_second_weight.device)
-        # )
-        # self.assertAllClose(layer2.weight.detach(), expected_next_weight)
-        # if original_second_bias is not None:
-        #     self.assertAllClose(layer2.bias.detach(), original_second_bias)
-
-        # self.assertEqual(layer1.out_features, len(keep_idx))
+        expected_next_weight = original_second_weight.index_select(1, keep_indices)
+        self.assertAllClose(layer2.weight.detach(), expected_next_weight)
         self.assertEqual(layer2.in_features, layer1.out_features)
-        self.assertEqual(layer1.tensor_m.samples, 0)
-        self.assertEqual(layer1.tensor_s.samples, 0)
 
     def test_prune_raises_when_all_neurons_selected(self):
         """Attempting to prune every neuron should raise an AssertionError."""
