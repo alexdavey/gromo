@@ -327,6 +327,16 @@ class GrowingBlock(GrowingContainer):
             update_previous=True,
         )
 
+    def compute_optimal_delta(
+        self,
+        update: bool = True,
+        force_pseudo_inverse: bool = False,
+    ) -> None:
+        self.second_layer.compute_optimal_delta(
+            update=update,
+            force_pseudo_inverse=force_pseudo_inverse,
+        )
+
     def apply_change(self, extension_size: int | None = None) -> None:
         """
         Apply the optimal delta and extend the layer with current
