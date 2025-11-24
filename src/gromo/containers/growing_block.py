@@ -128,6 +128,14 @@ class GrowingBlock(GrowingContainer):
         """
         self.second_layer.scaling_factor = value  # type: ignore
 
+    # TODO: It's unclear if this is the right definition of "input" in general
+    @property
+    def input(self) -> torch.Tensor:
+        return self.second_layer.input
+
+    def projected_v_goal(self, input_vector: torch.Tensor) -> torch.Tensor:
+        return self.second_layer.projected_v_goal(input_vector)
+
     @staticmethod
     def set_default_values(
         activation: torch.nn.Module | None = None,
