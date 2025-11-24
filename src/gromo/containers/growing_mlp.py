@@ -97,6 +97,9 @@ class GrowingMLP(GrowingContainer):
             )
         )
 
+        for previous_layer, next_layer in zip(self.layers[:-1], self.layers[1:]):
+            previous_layer.next_module = next_layer
+
         self.set_growing_layers()
 
     def set_growing_layers(self) -> None:

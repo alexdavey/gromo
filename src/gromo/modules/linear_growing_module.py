@@ -746,6 +746,27 @@ class LinearGrowingModule(GrowingModule):
             name=self.tensor_m.name,
         )
 
+    def _refresh_statistics_after_shape_change(self) -> None:
+        """Reinitialize cached statistics after pruning or structural edits."""
+        input_dim = self.in_features + self.use_bias
+        self._tensor_s = TensorStatistic(
+            (input_dim, input_dim),
+            update_function=self.compute_s_update,
+            device=self.device,
+            name=self._tensor_s.name,
+        )
+        self.tensor_m = TensorStatistic(
+            (input_dim, self.out_features),
+            update_function=self.compute_m_update,
+            device=self.device,
+            name=self.tensor_m.name,
+        )
+        if self.tensor_m_prev is not None:
+            self.tensor_m_prev.reset()
+        if self.cross_covariance is not None:
+            self.cross_covariance.reset()
+        self.delete_update(include_previous=True, delete_output=True)
+
     # Optimal update computation
     def compute_optimal_added_parameters(
         self,

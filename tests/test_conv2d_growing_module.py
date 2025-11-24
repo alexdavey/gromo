@@ -1878,6 +1878,22 @@ class TestRestrictedConv2dGrowingModule(TestConv2dGrowingModule):
             ),
         )
 
+    def test_prune_noop_keeps_conv2d_state(self):
+        """A selector without True entries should leave conv layers untouched."""
+        layer, _ = self.create_demo_layers(bias=False, hidden_channels=3)
+        original_weight = layer.weight.detach().clone()
+        tensor_s_before = layer.tensor_s
+        tensor_m_before = layer.tensor_m
+
+        def selector(weight, __):
+            return torch.zeros(weight.shape[0], dtype=torch.bool, device=weight.device)
+
+        result = layer.prune(selector)
+        self.assertEqual(result, [])
+        self.assertAllClose(layer.weight.detach(), original_weight)
+        self.assertIs(layer.tensor_s, tensor_s_before)
+        self.assertIs(layer.tensor_m, tensor_m_before)
+
 
 class TestCreateLayerExtensionsConv2d(TestConv2dGrowingModuleBase):
     """Test create_layer_extensions method for Conv2dGrowingModule."""
