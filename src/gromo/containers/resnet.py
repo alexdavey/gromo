@@ -23,6 +23,8 @@ class ResNetBasicBlock(SequentialGrowingContainer):
         output_block_kernel_size: int = 3,
         reduction_factor: float = 0.0,
         small_inputs: bool = False,
+        inplanes: int = 64,
+        nb_stages: int = 4,
     ) -> None:
         """
         Initialize the ResNet with basic blocks.
@@ -54,7 +56,6 @@ class ResNetBasicBlock(SequentialGrowingContainer):
         self.activation = activation.to(device)
         self.small_inputs = small_inputs
         self.reduction_factor = reduction_factor
-        inplanes = 64
 
         if small_inputs:
             # For small inputs like CIFAR-10/100 (32x32)
@@ -91,7 +92,6 @@ class ResNetBasicBlock(SequentialGrowingContainer):
             )
 
         self.stages: nn.ModuleList = nn.ModuleList()
-        nb_stages = 4
         for i in range(nb_stages):
             # for the future we could remove the basic block of the first stage
             # as there is no dowsampling
@@ -263,6 +263,8 @@ def init_full_resnet_structure(
     reduction_factor: float = 1 / 64,
     small_inputs: bool | None = None,
     number_of_blocks_per_stage: int | tuple[int, int, int, int] = 2,
+    inplanes: int = 64,
+    nb_stages: int = 4,
 ) -> ResNetBasicBlock:
     """
     Initialize a ResNet-18 model with basic blocks.
@@ -317,6 +319,8 @@ def init_full_resnet_structure(
         output_block_kernel_size=output_block_kernel_size,
         reduction_factor=reduction_factor,
         small_inputs=small_inputs,
+        inplanes=64,
+        nb_stages=4,
     )
     if (
         isinstance(number_of_blocks_per_stage, (list, tuple))
