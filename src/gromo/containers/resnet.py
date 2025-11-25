@@ -319,8 +319,8 @@ def init_full_resnet_structure(
         output_block_kernel_size=output_block_kernel_size,
         reduction_factor=reduction_factor,
         small_inputs=small_inputs,
-        inplanes=64,
-        nb_stages=4,
+        inplanes=inplanes,
+        nb_stages=nb_stages,
     )
     if (
         isinstance(number_of_blocks_per_stage, (list, tuple))
@@ -334,7 +334,7 @@ def init_full_resnet_structure(
             "number_of_blocks_per_stage must be an int or a tuple of four ints."
         )
     # Append additional blocks to match ResNet-18 architecture
-    for stage_index in range(4):
+    for stage_index in range(nb_stages):
         for _ in range(1, blocks_per_stage[stage_index]):
             model.append_block(
                 stage_index=stage_index,
