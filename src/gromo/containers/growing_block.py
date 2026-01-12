@@ -615,7 +615,7 @@ class LinearGrowingBlock(GrowingBlock):
                 kwargs_second_layer=kwargs_second_layer,
             )
         )
-        with catch_warnings(category=UserWarning):
+        with catch_warnings():
             simplefilter("ignore", UserWarning)
             first_layer = LinearGrowingModule(
                 in_features=in_features,
@@ -736,7 +736,7 @@ class Conv2dGrowingBlock(GrowingBlock):
                     f"kernel_size specified in both arguments and kwargs for {name}, "
                     f"using value from kwargs."
                 )
-        with catch_warnings(category=UserWarning):
+        with catch_warnings():
             simplefilter("ignore", UserWarning)
             first_layer = growing_conv_type(
                 in_channels=in_channels,
