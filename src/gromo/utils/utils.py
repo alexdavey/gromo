@@ -3,7 +3,8 @@ from typing import Any, Callable, Iterable
 import numpy as np
 import torch
 import torch.nn as nn
-from deprecated import deprecated
+
+from gromo.utils.disk_dataset import MemMapDataset
 
 
 __global_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -39,13 +40,14 @@ def global_device() -> torch.device:
     return __global_device
 
 
-def get_correct_device(self, device: torch.device | str | None) -> torch.device:
+def get_correct_device(self: object, device: torch.device | str | None) -> torch.device:
     """Get the correct device based on precedence order
     Precedence works as follows:
         argument > config file > global_device
 
     Parameters
     ----------
+    self : object
     device : torch.device | str | None
         chosen device argument, leave empty to use config file
 
@@ -62,13 +64,14 @@ def get_correct_device(self, device: torch.device | str | None) -> torch.device:
     return device
 
 
-def torch_zeros(*size: tuple[int, int], **kwargs) -> torch.Tensor:
+def torch_zeros(*size: int, **kwargs: Any) -> torch.Tensor:
     """Create zero tensors on global selected device
 
     Parameters
     ----------
-    size : tuple[int, int]
-        size of tensor
+    *size : int
+        variable number of integers that form the shape tuple of the tensor
+    **kwargs : Any
 
     Returns
     -------
@@ -82,13 +85,14 @@ def torch_zeros(*size: tuple[int, int], **kwargs) -> torch.Tensor:
         return torch.zeros(*size, device=__global_device, **kwargs)
 
 
-def torch_ones(*size: tuple[int, int], **kwargs) -> torch.Tensor:
+def torch_ones(*size: int, **kwargs: Any) -> torch.Tensor:
     """Create one tensors on global selected device
 
     Parameters
     ----------
-    size : tuple[int, int]
-        size of tensor
+    *size : int
+        variable number of integers that form the shape tuple of the tensor
+    **kwargs : Any
 
     Returns
     -------
@@ -102,38 +106,15 @@ def torch_ones(*size: tuple[int, int], **kwargs) -> torch.Tensor:
         return torch.ones(*size, device=__global_device, **kwargs)
 
 
-@deprecated(
-    "This functionality is already integrated in the `GrowingModule` sub-classes."
-)
-def safe_forward(self, input: torch.Tensor) -> torch.Tensor:
-    """Safe Linear forward function for empty input tensors
-    Resolves bug with shape transformation when using cuda
-
-    Parameters
-    ----------
-    input : torch.Tensor
-        input tensor
-
-    Returns
-    -------
-    torch.Tensor
-        F.linear forward function output
-    """
-    assert (
-        input.shape[-1] == self.in_features
-    ), f"Input shape {input.shape} must match the input feature size. Expected: {self.in_features}, Found: {input.shape[-1]}"
-    if self.in_features == 0:
-        return torch.zeros(
-            input.shape[0], self.out_features, device=global_device(), requires_grad=True
-        )  # TODO: change to self.device?
-    return torch.nn.functional.linear(input, self.weight, self.bias)
-
-
-def set_from_conf(self, name: str, default: Any = None, setter: bool = True) -> Any:
+def set_from_conf(
+    self: object, name: str, default: Any = None, setter: bool = True
+) -> Any:
     """Standardize private argument setting from config file
 
     Parameters
     ----------
+    self : object
+        object where load_config() has been called
     name : str
         name of variable
     default : Any, optional
@@ -158,6 +139,17 @@ def set_from_conf(self, name: str, default: Any = None, setter: bool = True) -> 
     return value
 
 
+known_activations_zero_plus_gradient: dict[type[torch.nn.Module], float] = {
+    torch.nn.ReLU: 1.0,
+    torch.nn.GELU: 0.5,
+    torch.nn.SELU: 1.0507,
+    torch.nn.SiLU: 0.5,
+    torch.nn.Tanh: 1.0,
+    torch.nn.Sigmoid: 0.25,
+    torch.nn.Identity: 1.0,
+}
+
+
 def activation_fn(fn_name: str) -> nn.Module:
     """Create activation function module by name
 
@@ -168,8 +160,13 @@ def activation_fn(fn_name: str) -> nn.Module:
 
     Returns
     -------
-    torch.nn.Module
+    nn.Module
         activation function module
+
+    Raises
+    ------
+    ValueError
+        if the function is unknown
     """
     known_activations = {
         "relu": nn.ReLU(),
@@ -205,16 +202,24 @@ def compute_tensor_stats(tensor: torch.Tensor) -> dict[str, float]:
     dict[str, float]
         A dictionary containing the computed statistics.
     """
-    min_value = tensor.min().item()
-    max_value = tensor.max().item()
-    mean_value = tensor.mean().item()
-    std_value = tensor.std().item() if tensor.numel() > 1 else 0.0
-    return {
-        "min": min_value,
-        "max": max_value,
-        "mean": mean_value,
-        "std": std_value,
-    }
+    if tensor.numel() == 0:
+        return {
+            "min": float("nan"),
+            "max": float("nan"),
+            "mean": float("nan"),
+            "std": float("nan"),
+        }
+    else:
+        min_value = tensor.min().item()
+        max_value = tensor.max().item()
+        mean_value = tensor.mean().item()
+        std_value = tensor.std().item() if tensor.numel() > 1 else 0.0
+        return {
+            "min": min_value,
+            "max": max_value,
+            "mean": mean_value,
+            "std": std_value,
+        }
 
 
 def line_search(
@@ -274,11 +279,13 @@ def line_search(
 def mini_batch_gradient_descent(
     model: nn.Module | Callable,
     cost_fn: Callable,
-    X: torch.Tensor,
-    Y: torch.Tensor,
+    X: torch.Tensor | str,
+    Y: torch.Tensor | str,
     lrate: float,
     max_epochs: int,
     batch_size: int,
+    x_keys: list[str] = [],
+    y_keys: list[str] = [],
     parameters: Iterable | None = None,
     fast: bool = False,
     eval_fn: Callable | None = None,
@@ -289,21 +296,25 @@ def mini_batch_gradient_descent(
 
     Parameters
     ----------
-    model : nn.Module
+    model : nn.Module | Callable
         pytorch model or forwards function
     cost_fn : Callable
         cost function
-    X : torch.Tensor
-        input features
-    Y : torch.Tensor
-        true labels
+    X : torch.Tensor | str
+        input features or input file name
+    Y : torch.Tensor | str
+        true labels or labels' file name
     lrate : float
         learning rate
     max_epochs : int
         maximum epochs
     batch_size : int
         batch size
-    parameters: iterable | None, optional
+    x_keys: list[str], optional
+        input keys for lazy loading dataset, by default []
+    y_keys: list[str], optional
+        target keys for lazy loading dataset, by default []
+    parameters: Iterable | None, optional
         list of torch parameters in case the model is just a forward function, by default None
     fast : bool, optional
         fast implementation without evaluation, by default False
@@ -316,10 +327,36 @@ def mini_batch_gradient_descent(
     -------
     tuple[list[float], list[float]]
         train loss history, train accuracy history
+
+    Raises
+    ------
+    TypeError
+        if X and Y do not have the same type, or the type is not supported
+    ValueError
+        if X and Y are of type str and the keys are not given
+    AttributeError
+        if the model is just a forward function, the parameters argument must not be None or empty
     """
     loss_history, acc_history = [], []
 
-    dataset = torch.utils.data.TensorDataset(X, Y)
+    if type(X) is not type(Y):
+        raise TypeError(
+            f"X and Y should have the same type. Got {type(X)=} and {type(Y)=}"
+        )
+
+    if isinstance(X, str):
+        assert isinstance(Y, str)
+        if len(x_keys) <= 0 or len(y_keys) <= 0:
+            raise ValueError("At least one key is required for X and Y")
+        dataset = MemMapDataset(X, Y, x_keys, y_keys)
+    elif isinstance(X, torch.Tensor):
+        assert isinstance(Y, torch.Tensor)
+        dataset = torch.utils.data.TensorDataset(X, Y)
+    else:
+        raise TypeError(
+            f"Inappropriate type for X. Expected torch.Tensor or str. Got {type(X)}"
+        )
+
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
     if not isinstance(model, nn.Module):
@@ -329,7 +366,6 @@ def mini_batch_gradient_descent(
             )
     else:
         parameters = model.parameters()
-        saved_parameters = list(model.parameters())
     optimizer = torch.optim.AdamW(parameters, lr=lrate, weight_decay=0)
 
     for epoch in range(max_epochs):
@@ -372,9 +408,9 @@ def batch_gradient_descent(
     forward_fn: Callable,
     cost_fn: Callable,
     target: torch.Tensor,
-    optimizer,
+    optimizer: torch.optim.Optimizer,
     max_epochs: int = 100,
-    tol: float = 1e-5,
+    tol: float = 1e-5,  # noqa: ARG001
     fast: bool = True,
     eval_fn: Callable | None = None,
 ) -> tuple[list[float], list[float]]:
@@ -385,7 +421,7 @@ def batch_gradient_descent(
     forward_fn : Callable
         Forward function
     cost_fn : Callable
-        _description_
+        cost function that computes loss between model output and target
     target : torch.Tensor
         target tensor
     optimizer : torch.optim.Optimizer
@@ -401,15 +437,15 @@ def batch_gradient_descent(
 
     Returns
     -------
-    list[float]
-        _description_
+    tuple[list[float], list[float]]
+        loss history, accuracy history
     """
     # print(target, target.shape)
     # temp = (target**2).sum()
     # print(temp)
     loss_history, acc_history = [], []
     min_loss = np.inf
-    prev_loss = np.inf
+    # prev_loss = np.inf
 
     for _ in range(max_epochs):
         output = forward_fn()
@@ -432,7 +468,7 @@ def batch_gradient_descent(
         #     break
         if loss.item() < min_loss:
             min_loss = loss.item()
-        prev_loss = loss.item()
+        # prev_loss = loss.item()
         # target.detach_()
 
     return loss_history, acc_history
@@ -569,7 +605,7 @@ def evaluate_dataset(
 
     Parameters
     ----------
-    model : torch.nn.Module
+    model : nn.Module
         network to evaluate
     dataloader : torch.utils.data.DataLoader
         dataloader containing the data
@@ -618,7 +654,7 @@ def evaluate_extended_dataset(
 
     Parameters
     ----------
-    model : torch.nn.Module
+    model : nn.Module
         network to evaluate
     dataloader : torch.utils.data.DataLoader
         dataloader containing the data
@@ -641,7 +677,7 @@ def evaluate_extended_dataset(
         x = x.to(global_device())
         y = y.to(global_device())
         with torch.no_grad():
-            pred = model.extended_forward(x, mask=mask)
+            pred, _ = model.extended_forward(x, mask=mask)
             loss.append(loss_fn(pred, y).item())
 
         if model.out_features > 1 and y.dim() == 1:

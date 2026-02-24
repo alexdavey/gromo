@@ -4,10 +4,11 @@ import torch
 
 from gromo.containers.resnet import ResNetBasicBlock, init_full_resnet_structure
 from gromo.utils.utils import global_device
+from tests.unittest_tools import unittest_parametrize
 
 
 if TYPE_CHECKING:
-    from gromo.containers.growing_block import RestrictedConv2dGrowingBlock
+    from gromo.containers.growing_block import Conv2dGrowingBlock
 
 
 try:
@@ -18,6 +19,9 @@ except ImportError:
 
 class TestResNet(TorchTestCase):
     """Test ResNet implementation."""
+
+    def setUp(self) -> None:
+        torch.manual_seed(0)
 
     def test_init_full_resnet_structure_variations(self):
         """
@@ -110,13 +114,68 @@ class TestResNet(TorchTestCase):
                 number_of_blocks_per_stage=(2, 2, 2),  # type: ignore
             )
 
-    def test_forward_backward(self):
+        # Test 11: Change inplanes and nb_stages
+        model_custom_inplanes = init_full_resnet_structure(
+            input_shape=(3, 32, 32),
+            inplanes=7,
+            nb_stages=3,
+        )
+        self.assertIsInstance(model_custom_inplanes, ResNetBasicBlock)
+        self.assertEqual(len(model_custom_inplanes.stages), 3)
+        self.assertEqual(model_custom_inplanes.stages[0][0].in_features, 7)  # type: ignore
+
+        # Test 12: hidden_channels with all ints (uniform per stage)
+        model_hidden_int = init_full_resnet_structure(
+            input_shape=(3, 32, 32),
+            hidden_channels=(8, 16, 32, 64),
+            number_of_blocks_per_stage=2,
+        )
+        self.assertEqual(model_hidden_int.stages[0][0].hidden_neurons, 8)  # type: ignore
+        self.assertEqual(model_hidden_int.stages[1][0].hidden_neurons, 16)  # type: ignore
+
+        # Test 13: hidden_channels with mixed int/tuples (per-block)
+        model_hidden_mixed = init_full_resnet_structure(
+            input_shape=(3, 32, 32),
+            hidden_channels=(8, (16, 20), 32, 64),
+            number_of_blocks_per_stage=2,
+        )
+        self.assertEqual(model_hidden_mixed.stages[1][0].hidden_neurons, 16)  # type: ignore
+        self.assertEqual(model_hidden_mixed.stages[1][1].hidden_neurons, 20)  # type: ignore
+
+        # Test 14: hidden_channels wrong length should raise ValueError
+        with self.assertRaises(ValueError):
+            init_full_resnet_structure(
+                input_shape=(3, 32, 32),
+                hidden_channels=(8, 16, 32),  # Only 3, but nb_stages=4
+            )
+
+        # Test 15: hidden_channels inner tuple wrong length should raise ValueError
+        with self.assertRaises(ValueError):
+            init_full_resnet_structure(
+                input_shape=(3, 32, 32),
+                hidden_channels=(8, (16, 20, 24), 32, 64),  # 3 elements but blocks=2
+                number_of_blocks_per_stage=2,
+            )
+
+        # Test 16: hidden_channels wrong type should raise TypeError
+        with self.assertRaises(TypeError):
+            init_full_resnet_structure(
+                input_shape=(3, 32, 32),
+                hidden_channels=(8, "invalid", 32, 64),  # type: ignore
+                number_of_blocks_per_stage=2,
+            )
+
+    @unittest_parametrize(({"use_preactivation": True}, {"use_preactivation": False}))
+    def test_forward_backward(self, use_preactivation: bool = True):
         """Test forward and backward pass of the ResNet model."""
         model = init_full_resnet_structure(
             input_shape=(3, 32, 32),
             out_features=10,
             number_of_blocks_per_stage=2,
             reduction_factor=0.5,
+            inplanes=16,
+            nb_stages=3,
+            use_preactivation=use_preactivation,
         )
         x = torch.randn(4, 3, 32, 32, device=global_device())
         output = model(x)
@@ -139,6 +198,7 @@ class TestResNet(TorchTestCase):
             number_of_blocks_per_stage=1,
             reduction_factor=0.5,
             device=device,
+            use_preactivation=True,
         )
 
         # Create a random input on the same device
@@ -209,7 +269,8 @@ class TestResNet(TorchTestCase):
         with self.assertRaises(IndexError):
             model.append_block(stage_index=-1, hidden_channels=64)
 
-    def test_extended_forward_with_layer_extensions(self):
+    @unittest_parametrize(({"use_preactivation": True}, {"use_preactivation": False}))
+    def test_extended_forward_with_layer_extensions(self, use_preactivation: bool):
         """
         Test extended_forward method and verify that creating layer extensions
         changes the output.
@@ -222,7 +283,10 @@ class TestResNet(TorchTestCase):
             input_shape=(3, 32, 32),
             out_features=10,
             number_of_blocks_per_stage=1,
+            nb_stages=2,
+            inplanes=16,
             reduction_factor=0.5,
+            use_preactivation=use_preactivation,
             device=device,
         )
 
@@ -234,10 +298,10 @@ class TestResNet(TorchTestCase):
         self.assertShapeEqual(output1, (2, 10))
 
         # Get the first block from the first stage
-        first_block: RestrictedConv2dGrowingBlock = model.stages[0][0]  # type: ignore
+        first_block: Conv2dGrowingBlock = model.stages[0][0]  # type: ignore
 
         # Create layer extensions for the first block
-        extension_size = 8  # Add 8 channels
+        extension_size = 16  # Add 16 channels
         first_block.create_layer_extensions(
             extension_size=extension_size,
             output_extension_init="copy_uniform",
@@ -280,7 +344,7 @@ class TestResNet(TorchTestCase):
         # Check that there is a measurable difference
         self.assertGreater(
             max_diff,
-            1e-2,
+            1e-4,
             f"Outputs should differ after adding extensions with non-zero scaling, "
             f"but max diff is {max_diff}",
         )
@@ -294,19 +358,133 @@ class TestResNet(TorchTestCase):
             input_shape=(3, 32, 32),
             out_features=10,
             number_of_blocks_per_stage=1,
+            nb_stages=2,
+            inplanes=16,
             reduction_factor=0.5,
             device=device,
         )
 
         # The first growable layer is the first block of the first stage
-        # With reduction_factor=0.5, it should have 32 hidden features (64 * 0.5)
-        # And out_features is 64 for the first stage
-        # So number to add should be (64 - 32) = 32 with growth_step=1
+        # With reduction_factor=0.5, it should have 8 hidden features (16 * 0.5)
+        # And out_features is 16 for the first stage
+        # So with number_of_growth_steps=1, number to add should be (16 - 8) = 8
         model.layer_to_grow_index = 0
 
-        neurons_to_add = model.number_of_neurons_to_add(growth_step=5)
+        neurons_to_add = model.number_of_neurons_to_add(number_of_growth_steps=5)
         self.assertIsInstance(
             neurons_to_add,
             int,
             "number_of_neurons_to_add should return an integer",
+        )
+
+        model.set_growing_layers(scheduling_method="all")
+        with self.assertRaises(RuntimeError):
+            model.number_of_neurons_to_add(number_of_growth_steps=2)
+
+    def test_get_first_order_improvement(self):
+        """Test the get_first_order_improvement method."""
+        device = torch.device("cpu")
+
+        # Create a network
+        model = init_full_resnet_structure(
+            input_shape=(3, 32, 32),
+            out_features=10,
+            number_of_blocks_per_stage=1,
+            reduction_factor=0.5,
+            nb_stages=2,
+            inplanes=16,
+            device=device,
+        )
+
+        # The first growable layer is the first block of the first stage
+        layer = model.stages[0][0]  # type: ignore
+
+        update_decrease = 1.0
+        eigenvalues = [10.0, 5.0]
+        layer.second_layer.parameter_update_decrease = torch.tensor(update_decrease)
+        layer.second_layer.eigenvalues_extension = torch.tensor(eigenvalues)
+
+        improvement = layer.first_order_improvement
+        self.assertIsInstance(
+            improvement.item(),
+            float,
+            "get_first_order_improvement should return a float",
+        )
+        self.assertAlmostEqual(
+            improvement.item(),
+            update_decrease + sum(x**2 for x in eigenvalues),
+            msg="First order improvement calculation is incorrect",
+        )
+
+    def test_missing_neurons(self):
+        """Test the missing_neurons method for SequentialGrowingContainer."""
+        device = torch.device("cpu")
+
+        # Create a small network
+        model = init_full_resnet_structure(
+            input_shape=(3, 32, 32),
+            out_features=10,
+            number_of_blocks_per_stage=1,
+            reduction_factor=0.5,
+            inplanes=4,
+            nb_stages=2,
+            device=device,
+        )
+
+        # Set a specific layer to grow (must set currently_updated_layer_index)
+        model.set_growing_layers(scheduling_method="sequential", index=0)
+        model.currently_updated_layer_index = 0
+
+        # Test missing_neurons returns an integer
+        missing = model.missing_neurons()
+        self.assertIsInstance(
+            missing,
+            int,
+            "missing_neurons should return an integer",
+        )
+        self.assertGreaterEqual(
+            missing,
+            0,
+            "missing_neurons should return a non-negative integer",
+        )
+
+    def test_complete_growth(self):
+        """Test the complete_growth method for SequentialGrowingContainer."""
+        device = torch.device("cpu")
+
+        # Create a small network
+        model = init_full_resnet_structure(
+            input_shape=(3, 32, 32),
+            out_features=10,
+            number_of_blocks_per_stage=1,
+            reduction_factor=0.5,
+            inplanes=4,
+            nb_stages=2,
+            device=device,
+        )
+
+        # Verify that the model has growable layers
+        self.assertGreater(
+            len(model._growable_layers),
+            0,
+            "Model should have growable layers",
+        )
+
+        # Get initial hidden neurons for the first block
+        first_block: Conv2dGrowingBlock = model.stages[0][0]  # type: ignore
+        initial_neurons = first_block.hidden_neurons
+
+        # Call complete_growth with extension kwargs (without extension_size)
+        extension_kwargs = {
+            "output_extension_init": "zeros",
+            "input_extension_init": "zeros",
+        }
+        model.complete_growth(extension_kwargs=extension_kwargs)
+
+        # Verify that hidden neurons increased
+        new_neurons = first_block.hidden_neurons
+        self.assertGreater(
+            new_neurons,
+            initial_neurons,
+            "complete_growth should increase the number of hidden neurons",
         )

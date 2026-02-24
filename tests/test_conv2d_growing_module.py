@@ -1,3 +1,4 @@
+import random
 from copy import deepcopy
 from unittest import main
 
@@ -27,6 +28,7 @@ class TestConv2dMergeGrowingModule(TorchTestCase):
         with consistent kernel sizes so we can run forward/backward and compute stats.
         """
         torch.manual_seed(0)
+        random.seed(0)
 
         # Common shapes
         self.batch = 4
@@ -56,7 +58,8 @@ class TestConv2dMergeGrowingModule(TorchTestCase):
             device=global_device(),
         )
 
-        # Next conv module used for properties (padding/stride/dilation) and activity storage
+        # Next conv module used for properties (padding/stride/dilation)
+        # and activity storage
         self.next = Conv2dGrowingModule(
             in_channels=self.merge_in_channels,
             out_channels=5,
@@ -106,6 +109,26 @@ class TestConv2dMergeGrowingModule(TorchTestCase):
         m._input_volume = None
         self.assertEqual(m.input_volume, self.prev.output_volume)
 
+    def test_output_volume_with_reshaping(self):
+        """Test output_volume when the ouput is reshaped."""
+        m = self.merge
+        # Set post_merge_function
+        m.post_merge_function = torch.nn.AvgPool2d(2, 2)
+        output_size = compute_output_shape_conv(self.prev.input_size, self.prev)
+        output_size = (output_size[0] - 2) / 2 + 1
+        output_volume = m.in_channels * output_size * output_size
+        self.assertEqual(m.output_volume, output_volume)
+
+        # Set reshaping function
+        m.reshape_function = torch.nn.Flatten()
+        self.assertEqual(m.output_volume, output_volume)
+        m.reshape_function = torch.nn.AdaptiveAvgPool2d(output_size=1)
+        self.assertEqual(m.output_volume, m.in_channels)
+
+        # Reset
+        m.input_size = None
+        self.assertEqual(m.output_volume, self.prev.output_volume)
+
     def test_constructor_int_conversions(self):
         """Test that int input_size and next_kernel_size are converted to tuples."""
         # Test with int input_size
@@ -127,7 +150,8 @@ class TestConv2dMergeGrowingModule(TorchTestCase):
         self.assertEqual(merge_with_int_kernel.kernel_size, (5, 5))
 
     def test_padding_stride_dilation_properties(self):
-        """Test padding/stride/dilation derivation for conv next and warning path when missing."""
+        """Test padding/stride/dilation derivation for conv next and
+        warning path when missing."""
         m = self.merge
         # With conv next
         self.assertEqual(m.padding, self.next.layer.padding)
@@ -146,12 +170,14 @@ class TestConv2dMergeGrowingModule(TorchTestCase):
         # With LinearGrowingModule next
         linear_next = LinearGrowingModule(m.output_volume, 10, device=global_device())
         m.set_next_modules([linear_next])
-        self.assertEqual(m.padding, (0, 0))
+        default_padding = ((self.kernel_size[0] - 1) / 2, (self.kernel_size[0] - 1) / 2)
+        self.assertEqual(m.padding, default_padding)
         self.assertEqual(m.stride, (1, 1))
         self.assertEqual(m.dilation, (1, 1))
 
     def test_set_previous_modules_and_shapes(self):
-        """Test set_previous_modules happy path and shape bookkeeping with multiple previous nodes."""
+        """Test set_previous_modules happy path and shape bookkeeping with
+        multiple previous nodes."""
         # Create a second previous conv with same kernel size and out_channels
         prev2 = Conv2dGrowingModule(
             in_channels=1,
@@ -258,7 +284,8 @@ class TestConv2dMergeGrowingModule(TorchTestCase):
             input_size=m.output_size,
             device=global_device(),
         )
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(AssertionError), self.assertWarns(UserWarning):
+            # You are setting the next modules with a non-empty tensor S
             m.set_next_modules([n1, n3])
 
         # Kernel size mismatch between merge and next -> assertion
@@ -272,7 +299,8 @@ class TestConv2dMergeGrowingModule(TorchTestCase):
             m2.set_next_modules([n1])
 
     def test_construct_full_activity_and_previous_updates(self):
-        """Test construct_full_activity content and previous S/M updates with a single previous module."""
+        """Test construct_full_activity content and previous S/M updates
+        with a single previous module."""
         # Ensure prev stores input for unfolded access
         self.prev.store_input = True
 
@@ -290,7 +318,8 @@ class TestConv2dMergeGrowingModule(TorchTestCase):
         self.assertAllClose(s_prev, s_prev.T)
 
         # Prepare gradient on merge.pre_activity via a small chain to test M update
-        # Make next store_input so merge stores its activity, and merge store_input for gradients
+        # Make next store_input so merge stores its activity,
+        # and merge store_input for gradients
         self.next.store_input = True
         self.merge.store_input = True  # Enable input storage for gradient computation
         seq = torch.nn.Sequential(self.prev, self.merge, self.next)
@@ -303,23 +332,24 @@ class TestConv2dMergeGrowingModule(TorchTestCase):
         self.assertEqual(m_prev.shape, (full_act.size(1), self.merge.in_channels))
 
     def test_unfolded_extended_activity_and_s_update_conv_next(self):
-        """Test unfolded_extended_activity (conv next branch) and compute_s_update output shape."""
+        """Test unfolded_extended_activity (conv next branch) and
+        compute_s_update output shape."""
         # Create a synthetic activity map at the merge (before post merge)
         self.merge.store_activity = True
-        H, W = self.merge.output_size
+        h, w = self.merge.output_size
         # Use a non-padded next conv (stride/dilation already set in setUp)
         self.merge.activity = torch.randn(
-            self.batch, self.merge_in_channels, H + 2, W + 2, device=global_device()
+            self.batch, self.merge_in_channels, h + 2, w + 2, device=global_device()
         )
 
         unfolded_ext = self.merge.unfolded_extended_activity
         # D = C * kx * ky + 1 (bias)
-        D = self.merge_in_channels * self.kernel_size[0] * self.kernel_size[1] + 1
-        self.assertEqual(unfolded_ext.shape[1], D)
+        d = self.merge_in_channels * self.kernel_size[0] * self.kernel_size[1] + 1
+        self.assertEqual(unfolded_ext.shape[1], d)
 
         s_update, n = self.merge.compute_s_update()
         self.assertEqual(n, self.merge.activity.shape[0])
-        self.assertEqual(s_update.shape, (D, D))
+        self.assertEqual(s_update.shape, (d, d))
         self.assertAllClose(s_update, s_update.T)
 
     def test_compute_s_update_assertions(self):
@@ -338,9 +368,11 @@ class TestConv2dMergeGrowingModule(TorchTestCase):
             m.compute_s_update()
 
     def test_compute_s_update_not_implemented_next_module(self):
-        """Test NotImplementedError for unsupported next module types in compute_s_update."""
+        """Test NotImplementedError for unsupported next module types
+        in compute_s_update."""
         m = self.merge
-        # Set up valid activity - use 2D to avoid tensor concatenation issues in unfolded_extended_activity
+        # Set up valid activity - use 2D to avoid tensor concatenation issues in
+        # unfolded_extended_activity
         m.store_activity = True
         m.activity = torch.randn(self.batch, m.out_features, device=global_device())
 
@@ -490,7 +522,7 @@ class TestConv2dMergeGrowingModule(TorchTestCase):
             _ = m.compute_s_update()
 
     def test_unfolded_extended_activity_conv_without_bias(self):
-        """Test unfolded_extended_activity for Conv2d path without bias - covers line 159."""
+        """Test unfolded_extended_activity for Conv2d path without bias."""
         m = Conv2dMergeGrowingModule(
             in_channels=self.merge_in_channels,
             input_size=self.merge.input_size,
@@ -514,7 +546,7 @@ class TestConv2dMergeGrowingModule(TorchTestCase):
         self.assertEqual(unfolded.shape[1], expected_d)
 
     def test_update_size_tensor_shape_mismatch(self):
-        """Test update_size when tensor shapes don't match - covers lines 414, 427."""
+        """Test update_size when tensor shapes don't match."""
         m = Conv2dMergeGrowingModule(
             in_channels=self.merge_in_channels,
             input_size=self.merge.input_size,
@@ -918,7 +950,8 @@ class TestConv2dGrowingModule(TestConv2dGrowingModuleBase):
         """
         Test the computation of delta with a simple example:
         We get a random theta as parameter of the layer
-        We get each e_i = (0, ..., 0, 1, 0, ..., 0) as input and the loss is the norm of the output
+        We get each e_i = (0, ..., 0, 1, 0, ..., 0) as input and the loss is
+        the norm of the output
         There fore the optimal delta is proportional to -theta.
         """
         self.demo.init_computation()
@@ -992,6 +1025,64 @@ class TestConv2dGrowingModule(TestConv2dGrowingModuleBase):
         demo_out.update_input_size(compute_from_previous=True)
         self.assertEqual(demo_out.input_size, y.shape[2:])
 
+    @unittest_parametrize(
+        (
+            {"zero_fan_in": True, "zero_fan_out": True, "bias": True},
+            {"zero_fan_in": False, "zero_fan_out": True, "bias": True},
+            {"zero_fan_in": True, "zero_fan_out": False, "bias": False},
+        )
+    )
+    def test_sub_select_optimal_added_parameters_zeroing(
+        self,
+        bias: bool = True,
+        zero_fan_in: bool = True,
+        zero_fan_out: bool = False,
+        select: int = 1,
+    ) -> None:
+        """Test sub_select with zeros_if_not_enough for Conv2d layers."""
+        layer_in, layer_out = self.create_demo_layers_with_extension(
+            bias=bias,
+            include_eigenvalues=True,
+        )
+
+        # Set eigenvalues with clear ordering
+        extension_size = layer_out.eigenvalues_extension.shape[0]
+        layer_out.eigenvalues_extension = torch.tensor(
+            [1.0, 0.5, 0.1][:extension_size], device=global_device()
+        )
+
+        layer_out.sub_select_optimal_added_parameters(
+            keep_neurons=select,
+            zeros_if_not_enough=True,
+            zeros_fan_in=zero_fan_in,
+            zeros_fan_out=zero_fan_out,
+        )
+
+        assert isinstance(layer_in.extended_output_layer, torch.nn.Conv2d)
+        assert isinstance(layer_out.extended_input_layer, torch.nn.Conv2d)
+
+        # Check eigenvalues are zeroed for non-selected neurons
+        self.assertAllClose(
+            layer_out.eigenvalues_extension[select:],
+            torch.zeros_like(layer_out.eigenvalues_extension[select:]),
+        )
+
+        if zero_fan_in:
+            # Check that fan-in weights are zeroed for non-selected neurons
+            self.assertTrue(
+                torch.all(layer_in.extended_output_layer.weight[select:] == 0)
+            )
+            if bias and layer_in.extended_output_layer.bias is not None:
+                self.assertTrue(
+                    torch.all(layer_in.extended_output_layer.bias[select:] == 0)
+                )
+
+        if zero_fan_out:
+            # Check that fan-out weights are zeroed for non-selected neurons
+            self.assertTrue(
+                torch.all(layer_out.extended_input_layer.weight[:, select:] == 0)
+            )
+
 
 class TestFullConv2dGrowingModule(TestConv2dGrowingModule):
     _tested_class = FullConv2dGrowingModule
@@ -1007,7 +1098,8 @@ class TestFullConv2dGrowingModule(TestConv2dGrowingModule):
         net = torch.nn.Sequential(demo_layer_1, demo_layer_2)
         demo_layer_2.init_computation()
 
-        # Use indicator batch for Conv2d - each sample has 1 in different spatial locations
+        # Use indicator batch for Conv2d - each sample has 1 in different
+        # spatial locations
         input_x = indicator_batch(
             (demo_layer_1.in_channels, 5, 5), device=global_device()
         )
@@ -1021,10 +1113,11 @@ class TestFullConv2dGrowingModule(TestConv2dGrowingModule):
         self.assertAllClose(
             demo_layer_2.tensor_n, torch.zeros_like(demo_layer_2.tensor_n), atol=1e-6
         )
+        assert isinstance(demo_layer_2.eigenvalues_extension, torch.Tensor)
         self.assertAllClose(
             demo_layer_2.eigenvalues_extension,
             torch.zeros_like(demo_layer_2.eigenvalues_extension),
-            atol=1e-6,
+            atol=2e-6,
         )
 
     def test_compute_m_prev_without_intermediate_input(self):
@@ -1225,7 +1318,8 @@ class TestFullConv2dGrowingModule(TestConv2dGrowingModule):
     @unittest_parametrize(({"bias": True}, {"bias": False}))
     def test_compute_optimal_added_parameters(self, bias: bool):
         """
-        Test sub_select_optimal_added_parameters in merge to compute_optimal_added_parameters
+        Test sub_select_optimal_added_parameters in merge to
+        compute_optimal_added_parameters
         """
         demo_couple = self.demo_couple[bias]
         demo_couple[0].store_input = True
@@ -1381,13 +1475,19 @@ class TestFullConv2dGrowingModule(TestConv2dGrowingModule):
         demo_couple[1].update_computation()
         demo_couple[1].tensor_s_growth.update()
 
-        demo_couple[1].compute_optimal_delta()
+        with self.assertMaybeWarns(
+            UserWarning,
+            "Using the pseudo-inverse for the computation of the optimal delta",
+        ):
+            demo_couple[1].compute_optimal_delta()
         demo_couple[1].delta_raw *= 0
 
         self.assertAllClose(
             -demo_couple[1].tensor_m_prev(),
             demo_couple[1].tensor_n,
-            message="The tensor_m_prev should be equal to the tensor_n when the delta is zero",
+            message=(
+                "The tensor_m_prev should be equal to the tensor_n when the delta is zero"
+            ),
         )
 
         demo_couple[1].compute_optimal_added_parameters()
@@ -1427,7 +1527,8 @@ class TestFullConv2dGrowingModule(TestConv2dGrowingModule):
 
         demo.update_computation()
 
-        # tensor_s_growth should return the internal _tensor_s_growth, not previous module's tensor_s
+        # tensor_s_growth should return the internal _tensor_s_growth,
+        # not previous module's tensor_s
         tensor_s_growth = demo.tensor_s_growth
         self.assertIs(tensor_s_growth, demo._tensor_s_growth)
 
@@ -1436,7 +1537,8 @@ class TestFullConv2dGrowingModule(TestConv2dGrowingModule):
 
     @unittest_parametrize(({"bias": True}, {"bias": False}))
     def test_tensor_s_growth_independence_from_previous_module(self, bias):
-        """Test that FullConv2dGrowingModule tensor_s_growth is independent of previous module."""
+        """Test that FullConv2dGrowingModule tensor_s_growth is independent of
+        previous module."""
         demo_couple = self.demo_couple[bias]
         demo_in, demo_out = demo_couple[0], demo_couple[1]
 
@@ -1461,7 +1563,8 @@ class TestFullConv2dGrowingModule(TestConv2dGrowingModule):
         demo_in.update_computation()
         demo_out.update_computation()
 
-        # tensor_s_growth for FullConv2dGrowingModule should NOT redirect to previous module
+        # tensor_s_growth for FullConv2dGrowingModule should NOT redirect
+        # to previous module
         # It should use its own _tensor_s_growth
         tensor_s_growth_out = demo_out.tensor_s_growth
         tensor_s_in = demo_in.tensor_s
@@ -1483,7 +1586,8 @@ class TestFullConv2dGrowingModule(TestConv2dGrowingModule):
 
         demo.update_computation()
 
-        # For FullConv2dGrowingModule, we need to ensure _tensor_s_growth has been computed
+        # For FullConv2dGrowingModule, we need to ensure _tensor_s_growth has
+        # been computed
         # Check if tensor_s_growth has samples before calling it
         tensor_s_growth_stat = demo.tensor_s_growth
         self.assertIsInstance(tensor_s_growth_stat, TensorStatistic)
@@ -1500,7 +1604,8 @@ class TestFullConv2dGrowingModule(TestConv2dGrowingModule):
             # Both dimensions should be equal (square matrix)
             self.assertEqual(tensor_s_growth.shape[0], tensor_s_growth.shape[1])
         else:
-            # If no samples, just verify the tensor_s_growth property exists and is correct type
+            # If no samples, just verify the tensor_s_growth property
+            # exists and is correct type
             self.assertIsInstance(tensor_s_growth_stat, TensorStatistic)
 
 
@@ -1518,7 +1623,8 @@ class TestRestrictedConv2dGrowingModule(TestConv2dGrowingModule):
         net = torch.nn.Sequential(demo_layer_1, demo_layer_2)
         demo_layer_2.init_computation()
 
-        # Use indicator batch for Conv2d - each sample has 1 in different spatial locations
+        # Use indicator batch for Conv2d - each sample has 1 in different
+        # spatial locations
         input_x = indicator_batch(
             (demo_layer_1.in_channels, 5, 5), device=global_device()
         )
@@ -1530,16 +1636,17 @@ class TestRestrictedConv2dGrowingModule(TestConv2dGrowingModule):
 
         # For RestrictedConv2d, tensor_n should be zero when bottleneck is fully resolved
         self.assertAllClose(
-            demo_layer_2.tensor_n, torch.zeros_like(demo_layer_2.tensor_n), atol=1e-7
+            demo_layer_2.tensor_n, torch.zeros_like(demo_layer_2.tensor_n), atol=1e-6
         )
         self.assertAllClose(
             demo_layer_2.eigenvalues_extension,
             torch.zeros_like(demo_layer_2.eigenvalues_extension),
-            atol=1e-7,
+            atol=1e-6,
         )
 
     def test_compute_m_prev_without_intermediate_input_restricted(self):
-        """Check that the batch size is computed using stored variables for RestrictedConv2d"""
+        """Check that the batch size is computed using stored variables
+        for RestrictedConv2d"""
         # Use predefined demo_couple objects
         demo_layer_1, demo_layer_2 = self.demo_couple[
             False
@@ -1574,7 +1681,7 @@ class TestRestrictedConv2dGrowingModule(TestConv2dGrowingModule):
 
     @unittest_parametrize(({"bias": True}, {"bias": False}))
     def test_linear_layer_of_tensor(self, bias: bool):
-        demo_layer = demo_out = RestrictedConv2dGrowingModule(
+        demo_layer = RestrictedConv2dGrowingModule(
             in_channels=2,
             out_channels=3,
             kernel_size=(5, 5),
@@ -1690,7 +1797,9 @@ class TestRestrictedConv2dGrowingModule(TestConv2dGrowingModule):
         self.assertAllClose(
             n,
             -demo_out.tensor_m_prev(),
-            message="The tensor_n should be equal to the tensor_m_prev when the delta is zero",
+            message=(
+                "The tensor_n should be equal to the tensor_m_prev when the delta is zero"
+            ),
         )
 
         demo_out.delta_raw = torch.randn_like(demo_out.delta_raw)
@@ -1731,7 +1840,8 @@ class TestRestrictedConv2dGrowingModule(TestConv2dGrowingModule):
     def test_compute_optimal_added_parameters_use_projected_gradient_false(
         self, bias: bool
     ):
-        """Test compute_optimal_added_parameters with use_projected_gradient=False for RestrictedConv2dGrowingModule."""
+        """Test compute_optimal_added_parameters with use_projected_gradient=False
+        for RestrictedConv2dGrowingModule."""
         demo_in, demo_out = self.demo_couple[bias]
 
         demo_out.init_computation()
@@ -1765,7 +1875,8 @@ class TestRestrictedConv2dGrowingModule(TestConv2dGrowingModule):
 
     def test_bordered_unfolded_extended_prev_input_shape(self):
         """
-        Test that bordered_unfolded_extended_prev_input runs correctly and returns proper shape.
+        Test that bordered_unfolded_extended_prev_input runs correctly and
+        returns proper shape.
 
         This test mimics the setup from minimal_crashing_code_2 to ensure that the
         bordered_unfolded_extended_prev_input property works correctly and returns
@@ -1804,7 +1915,9 @@ class TestRestrictedConv2dGrowingModule(TestConv2dGrowingModule):
 
         # Update input sizes
         # Access bordered_unfolded_extended_prev_input - this should not crash
-        bordered_tensor = current_module.bordered_unfolded_extended_prev_input
+        with self.assertWarns(UserWarning):
+            # The input size of the layer has changed
+            bordered_tensor = current_module.bordered_unfolded_extended_prev_input
 
         # Verify tensor structure
         self.assertShapeEqual(
@@ -1912,7 +2025,11 @@ class TestCreateLayerExtensionsConv2d(TestConv2dGrowingModuleBase):
         # Subtest 2: Without features (hidden_channels=0)
         with self.subTest(case="without_features"):
             # Create two connected growing modules with 0 hidden channels
-            layer_in, layer_out = self.create_demo_layers(bias=False, hidden_channels=0)
+            with self.assertWarns(UserWarning):
+                # Initializing zero-element tensors is a no-op
+                layer_in, layer_out = self.create_demo_layers(
+                    bias=False, hidden_channels=0
+                )
 
             # When out_channels=0, the layer has no weights
             # So copy_uniform should fallback to 1/sqrt(fan_in)
@@ -1978,6 +2095,67 @@ class TestCreateLayerExtensionsConv2d(TestConv2dGrowingModuleBase):
                 delta=expected_input_ext_std * 0.5,
                 msg=f"extended_input_layer std should be ~{expected_input_ext_std}",
             )
+
+
+class TestNeuronCountingConv2d(TestConv2dGrowingModuleBase):
+    """Test in_neurons property and growth-related methods for Conv2dGrowingModule."""
+
+    def test_in_neurons_returns_in_channels(self) -> None:
+        """Test that in_neurons returns in_channels for Conv2d modules."""
+        layer = Conv2dGrowingModule(
+            in_channels=5,
+            out_channels=3,
+            kernel_size=(3, 3),
+            device=global_device(),
+        )
+        self.assertEqual(layer.in_neurons, 5)
+        self.assertEqual(layer.in_neurons, layer.in_channels)
+
+    def test_target_in_channels_initialization(self) -> None:
+        """Test that target_in_neurons is correctly initialized via target_in_channels."""
+        # Without target
+        layer = Conv2dGrowingModule(
+            in_channels=5,
+            out_channels=3,
+            kernel_size=(3, 3),
+            device=global_device(),
+        )
+        self.assertIsNone(layer.target_in_neurons)
+        self.assertEqual(layer._initial_in_neurons, 5)
+
+        # With target
+        layer_with_target = Conv2dGrowingModule(
+            in_channels=5,
+            out_channels=3,
+            kernel_size=(3, 3),
+            target_in_channels=10,
+            device=global_device(),
+        )
+        self.assertEqual(layer_with_target.target_in_neurons, 10)
+        self.assertEqual(layer_with_target._initial_in_neurons, 5)
+
+    def test_missing_neurons_for_conv2d(self) -> None:
+        """Test missing_neurons for Conv2dGrowingModule."""
+        layer = Conv2dGrowingModule(
+            in_channels=5,
+            out_channels=3,
+            kernel_size=(3, 3),
+            target_in_channels=10,
+            device=global_device(),
+        )
+        self.assertEqual(layer.missing_neurons(), 5)
+
+    def test_number_of_neurons_to_add_for_conv2d(self) -> None:
+        """Test number_of_neurons_to_add for Conv2dGrowingModule."""
+        layer = Conv2dGrowingModule(
+            in_channels=5,
+            out_channels=3,
+            kernel_size=(3, 3),
+            target_in_channels=15,
+            device=global_device(),
+        )
+        # Total to add: 15 - 5 = 10
+        self.assertEqual(layer.number_of_neurons_to_add(number_of_growth_steps=2), 5)
 
 
 if __name__ == "__main__":

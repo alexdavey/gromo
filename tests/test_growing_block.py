@@ -133,7 +133,7 @@ class TestLinearGrowingBlock(TorchTestCase):
         # Check basic properties
         self.assertEqual(block.in_features, self.in_features)
         self.assertEqual(block.out_features, self.in_features)
-        self.assertEqual(block.hidden_features, 0)
+        self.assertEqual(block.hidden_neurons, 0)
         self.assertEqual(block.name, "zero_block")
 
         # Check layer configurations
@@ -165,7 +165,7 @@ class TestLinearGrowingBlock(TorchTestCase):
         # Check basic properties
         self.assertEqual(block.in_features, self.in_features)
         self.assertEqual(block.out_features, self.in_features)
-        self.assertEqual(block.hidden_features, self.hidden_features)
+        self.assertEqual(block.hidden_neurons, self.hidden_features)
 
         # Check layer configurations
         self.assertEqual(block.first_layer.in_features, self.in_features)
@@ -285,8 +285,7 @@ class TestLinearGrowingBlock(TorchTestCase):
         self.assertAllClose(output, expected_output)
 
     def test_input_storage_zero_features_no_downsample(self):
-        """Test input and pre-activity storage with 0 hidden features and no
-        downsample."""
+        """Test input and pre-activity storage with 0 hidden features and no downsample."""
         block = LinearGrowingBlock(
             in_features=self.in_features,
             out_features=self.in_features,
@@ -738,6 +737,51 @@ class TestLinearGrowingBlock(TorchTestCase):
         self.assertEqual(block.scaling_factor, new_scaling_factor)
         self.assertEqual(block.second_layer.scaling_factor, new_scaling_factor)
 
+    def test_parameter_update_decrease_setter(self):
+        """Test parameter_update_decrease setter with Tensor and float."""
+        block = LinearGrowingBlock(
+            in_features=self.in_features,
+            out_features=self.in_features,
+            hidden_features=self.hidden_features,
+            device=self.device,
+        )
+
+        # Test setter with Tensor
+        tensor_value = torch.tensor(0.5, device=self.device)
+        block.parameter_update_decrease = tensor_value
+        self.assertIsInstance(block.parameter_update_decrease, torch.Tensor)
+        assert isinstance(block.second_layer.parameter_update_decrease, torch.Tensor)
+        self.assertEqual(
+            block.second_layer.parameter_update_decrease.item(),
+            tensor_value.item(),
+        )
+
+        # Test setter with float (should convert to tensor)
+        float_value = 0.3
+        block.parameter_update_decrease = float_value
+        self.assertAlmostEqual(
+            block.second_layer.parameter_update_decrease.item(),
+            float_value,
+        )
+
+        # Test setter with invalid type
+        with self.assertRaises(TypeError):
+            block.parameter_update_decrease = "invalid"  # type: ignore
+
+    def test_set_scaling_factor_method(self):
+        """Test set_scaling_factor method."""
+        block = LinearGrowingBlock(
+            in_features=self.in_features,
+            out_features=self.in_features,
+            hidden_features=self.hidden_features,
+            device=self.device,
+        )
+
+        # Test set_scaling_factor method
+        new_factor = 0.7
+        block.set_scaling_factor(new_factor)
+        self.assertEqual(block.second_layer.scaling_factor, new_factor)
+
     @unittest_parametrize(({"hidden_features": 0}, {"hidden_features": 3}))
     def test_init_computation(self, hidden_features: int = 0):
         """Test initialization of computation."""
@@ -949,7 +993,7 @@ class TestLinearGrowingBlock(TorchTestCase):
             block.second_layer.in_features,
             original_second_in_features + num_neurons_to_keep,
         )
-        self.assertEqual(block.hidden_features, num_neurons_to_keep)  # Was 0 before
+        self.assertEqual(block.hidden_neurons, num_neurons_to_keep)  # Was 0 before
 
         # Verify weights were extended properly
         self.assertShapeEqual(
@@ -1145,23 +1189,20 @@ class TestLinearGrowingBlock(TorchTestCase):
         3. Neither extension_size nor eigenvalues_extension (should raise
            assertion)
         """
-        # Setup: Create a block with some initial hidden features
-        initial_hidden_features = 2
-        block = LinearGrowingBlock(
-            in_features=self.in_features,
-            out_features=self.in_features,
-            hidden_features=initial_hidden_features,
-            device=self.device,
-        )
-
-        # Store original dimensions
-        original_first_out = block.first_layer.out_features
-        original_second_in = block.second_layer.in_features
-
         with self.subTest("Case 1: Explicit extension_size parameter"):
-            # Note: extension_size just tells the block how many neurons are
-            # being added (updates hidden_features), but all neurons from the
-            # extension layer are still used
+            # Setup: Create a block with some initial hidden features
+            initial_hidden_features = 2
+            block = LinearGrowingBlock(
+                in_features=self.in_features,
+                out_features=self.in_features,
+                hidden_features=initial_hidden_features,
+                device=self.device,
+            )
+
+            # Store original dimensions
+            original_first_out = block.first_layer.out_features
+            original_second_in = block.second_layer.in_features
+
             # Create second extension without bias as required by apply_change
             second_extension_no_bias = torch.nn.Linear(
                 self.added_features,
@@ -1183,8 +1224,8 @@ class TestLinearGrowingBlock(TorchTestCase):
 
             # Apply change with explicit size
             # This should add self.added_features (7) to the layers, and
-            # update hidden_features by extension_size
-            explicit_size = 2
+            # update hidden_features by the same amount
+            explicit_size = block.second_layer.extended_input_layer.in_features
             block.apply_change(extension_size=explicit_size)
 
             # Verify dimensions increased by the actual number of neurons
@@ -1197,9 +1238,9 @@ class TestLinearGrowingBlock(TorchTestCase):
                 block.second_layer.in_features,
                 original_second_in + self.added_features,
             )
-            # But hidden_features is updated by extension_size
+            # But hidden_neurons is updated by extension_size
             self.assertEqual(
-                block.hidden_features,
+                block.hidden_neurons,
                 initial_hidden_features + explicit_size,
             )
 
@@ -1253,9 +1294,9 @@ class TestLinearGrowingBlock(TorchTestCase):
                 block.second_layer.in_features,
                 original_second_in + self.added_features,
             )
-            # And hidden_features increased by eigenvalues shape
+            # And hidden_neurons increased by eigenvalues shape
             self.assertEqual(
-                block.hidden_features,
+                block.hidden_neurons,
                 initial_hidden_features + self.added_features,
             )
 
@@ -1376,3 +1417,26 @@ class TestLinearGrowingBlock(TorchTestCase):
         self.assertIsInstance(
             stats, dict, "weights_statistics should return a dictionary"
         )
+
+    def test_optimal_delta_layer_property(self):
+        """Test optimal_delta_layer getter and setter."""
+        block = LinearGrowingBlock(
+            in_features=self.in_features,
+            out_features=self.in_features,
+            hidden_features=self.hidden_features,
+            device=self.device,
+        )
+
+        # Test getter - initially should be None
+        self.assertIsNone(block.optimal_delta_layer)
+
+        # Test setter by calling the property setter directly
+        # (nn.Module.__setattr__ intercepts normal assignments)
+        delta_layer = torch.nn.Linear(self.hidden_features, self.in_features)
+        block.optimal_delta_layer = delta_layer
+        self.assertIs(block.optimal_delta_layer, delta_layer)
+        self.assertIs(block.second_layer.optimal_delta_layer, delta_layer)
+
+        # Test setter with None
+        block.optimal_delta_layer = None
+        self.assertIsNone(block.optimal_delta_layer)

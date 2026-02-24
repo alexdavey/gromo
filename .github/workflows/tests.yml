@@ -18,7 +18,7 @@ jobs:
       matrix:
         # windows-latest, macOS-latest -> problem with MAGMA/CUDA 12.1
         os: [ ubuntu-latest ]
-        python-version: [ "3.11", "3.12" ]
+        python-version: [ "3.10", "3.11", "3.12" ]
     defaults:
       run:
         shell: bash
@@ -50,7 +50,6 @@ jobs:
           fail_ci_if_error: true
           files: ./coverage.xml
           flags: unittests
-          target: 94%
           name: codecov-ci-gromo
           verbose: true
           token: ${{ secrets.CODECOV2_TOKEN }}

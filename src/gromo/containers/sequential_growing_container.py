@@ -7,6 +7,18 @@ from gromo.modules.growing_module import GrowingModule
 
 
 class SequentialGrowingContainer(GrowingContainer):
+    """Container for sequential model architectures
+
+    Parameters
+    ----------
+    in_features : int
+        input features, to be interpreted based on current needs
+    out_features : int
+        output features, to be interpreted based on current needs
+    device : torch.device | str | None, optional
+        default device, by default None
+    """
+
     def __init__(
         self,
         in_features: int,
@@ -40,9 +52,16 @@ class SequentialGrowingContainer(GrowingContainer):
             growing_layers list.
             "all": all layers in the _growable_layers list are added to the
             _growing_layers list.
-        index : int, optional
+        index : int | None, optional
             If scheduling_method is "sequential", this index specifies which layer to
             grow next.
+
+        Raises
+        ------
+        IndexError
+            if index is out of bounds for the number og growing_layers in the module
+        ValueError
+            if argument scheduling_method is not 'sequential' or 'all'
         """
         if isinstance(index, int):
             if index < 0 or index >= len(self._growable_layers):
@@ -59,6 +78,7 @@ class SequentialGrowingContainer(GrowingContainer):
             )
             self._growing_layers = [self._growable_layers[self.layer_to_grow_index]]
         elif scheduling_method == "all":
+            self.layer_to_grow_index = -1
             self._growing_layers = (  # pyright: ignore[reportIncompatibleVariableOverride]
                 self._growable_layers
             )
@@ -70,12 +90,27 @@ class SequentialGrowingContainer(GrowingContainer):
                 f"'sequential' and 'all'."
             )
 
-    def number_of_neurons_to_add(self, **kwargs) -> int:
+    def number_of_neurons_to_add(self, **kwargs: Any) -> int:
         """Get the number of neurons to add in the next growth step."""
-        raise NotImplementedError
+        if self.layer_to_grow_index < 0:
+            raise RuntimeError(
+                "number_of_neurons_to_add is only supported when a single layer is being "
+                "grown (e.g. with scheduling_method='sequential'). A negative "
+                "layer_to_grow_index usually indicates that multiple layers are being "
+                "grown at once, which is not supported by this method."
+            )
+        return self._growable_layers[self.layer_to_grow_index].number_of_neurons_to_add(
+            **kwargs
+        )
 
     def update_information(self) -> dict[str, Any]:
-        """Get information about the current state of the growing layers."""
+        """Update information for all growing layers including first order improvement
+
+        Returns
+        -------
+        dict[str, Any]
+            information dictionary
+        """
         information = {}
         for i, layer in enumerate(self._growing_layers):
             assert isinstance(
@@ -88,3 +123,12 @@ class SequentialGrowingContainer(GrowingContainer):
             }
             information[i] = layer_information
         return information
+
+    def missing_neurons(self) -> int:
+        """Get the number of missing neurons to reach the target size."""
+        return self.currently_updated_layer.missing_neurons()
+
+    def complete_growth(self, extension_kwargs: dict) -> None:
+        """Complete the growth to the target size."""
+        for layer in self._growable_layers:
+            layer.complete_growth(extension_kwargs=extension_kwargs)

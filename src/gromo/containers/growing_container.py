@@ -8,15 +8,31 @@ from gromo.utils.utils import get_correct_device
 
 
 class GrowingContainer(torch.nn.Module):
+    """Container interface to represent different types of model architectures
+
+    Parameters
+    ----------
+    in_features : int
+        input features, to be interpreted based on current needs
+    out_features : int
+        output features, to be interpreted based on current needs
+    device : torch.device | str | None, optional
+        default device, by default None
+    name : str, optional
+        name of the model, by default "GrowingContainer"
+    """
+
     def __init__(
         self,
         in_features: int,
         out_features: int,
         device: torch.device | str | None = None,
+        name: str = "GrowingContainer",
     ) -> None:
         super(GrowingContainer, self).__init__()
         self._config_data, _ = load_config()
         self.device = get_correct_device(self, device)
+        self.name = name
 
         self.in_features = in_features
         self.out_features = out_features
@@ -28,8 +44,9 @@ class GrowingContainer(torch.nn.Module):
 
     def set_growing_layers(self) -> None:
         """
-        Reference all growable layers of the model in the _growing_layers private attribute. This method should be implemented
-        in the child class and called in the __init__ method.
+        Reference all growable layers of the model in the _growing_layers private
+        attribute. This method should be implementedbin the child class and called
+        in the __init__ method.
         """
         raise NotImplementedError
 
@@ -45,14 +62,16 @@ class GrowingContainer(torch.nn.Module):
             if isinstance(layer, GrowingContainer):
                 layer.set_scaling_factor(factor)
             elif isinstance(layer, GrowingModule):
-                layer.scaling_factor = factor
+                layer.scaling_factor = factor  # type: ignore
                 layer._scaling_factor_next_module.data[0] = factor
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass through the network"""
         raise NotImplementedError
 
-    def extended_forward(self, x: torch.Tensor, mask: dict = {}) -> torch.Tensor:
+    def extended_forward(
+        self, x: torch.Tensor, mask: dict = {}
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Extended forward pass through the network"""
         raise NotImplementedError
 
@@ -86,7 +105,8 @@ class GrowingContainer(torch.nn.Module):
         Parameters
         ----------
         update : bool, optional
-            update the optimal delta layer attribute and the first order decrease, by default True
+            update the optimal delta layer attribute and the first order decrease,
+            by default True
         force_pseudo_inverse : bool, optional
             use the pseudo-inverse to compute the optimal delta even if the
             matrix is invertible, by default False
@@ -97,7 +117,7 @@ class GrowingContainer(torch.nn.Module):
                 force_pseudo_inverse=force_pseudo_inverse,
             )
 
-    def compute_optimal_updates(self, *args, **kwargs) -> None:
+    def compute_optimal_updates(self, *args: Any, **kwargs: Any) -> None:
         """Compute optimal updates for growth procedure"""
         for layer in self._growing_layers:
             if isinstance(layer, (GrowingModule, GrowingContainer)):
@@ -120,11 +140,36 @@ class GrowingContainer(torch.nn.Module):
                 layer.delete_update()
         return self.currently_updated_layer_index
 
-    def dummy_select_update(self, **_) -> int:
+    def dummy_select_update(self, **_: dict) -> int:
+        """Placeholder function for selecting update
+
+        Parameters
+        ----------
+        **_ : dict
+
+        Returns
+        -------
+        int
+            always zero
+        """
         self.currently_updated_layer_index = 0
         return 0
 
     def select_update(self, layer_index: int, verbose: bool = False) -> int:
+        """Select the updates of a layer with a specific index and delete the rest
+
+        Parameters
+        ----------
+        layer_index : int
+            selected layer index
+        verbose : bool, optional
+            print info, by default False
+
+        Returns
+        -------
+        int
+            selected layer index
+        """
         self.currently_updated_layer_index = layer_index
         for i, layer in enumerate(self._growing_layers):
             if verbose:

@@ -4,18 +4,30 @@ import unittest
 import torch
 from torch.nn.functional import one_hot
 
-from gromo.containers.growing_dag import Expansion, GrowingDAG
+from gromo.containers.growing_dag import (
+    Expansion,
+    ExpansionType,
+    GrowingDAG,
+    InterMergeExpansion,
+)
 from gromo.containers.growing_graph_network import GrowingGraphNetwork
 from gromo.utils.utils import global_device
-from tests.unittest_tools import unittest_parametrize
 
 
-class TestGrowingGraphNetwork(unittest.TestCase):
+try:
+    from tests.torch_unittest import TorchTestCase  # type: ignore
+    from tests.unittest_tools import unittest_parametrize  # type: ignore
+except ImportError:
+    from torch_unittest import TorchTestCase  # type: ignore
+    from unittest_tools import unittest_parametrize  # type: ignore
+
+
+class TestGrowingGraphNetwork(TorchTestCase):
     def setUp(self) -> None:
-        self.in_features = 5
+        self.in_features = 3
         self.out_features = 2
         self.batch_size = 8
-        self.neurons = 10
+        self.neurons = 5
 
         # Linear Graph
         self.net = GrowingGraphNetwork(
@@ -132,34 +144,13 @@ class TestGrowingGraphNetwork(unittest.TestCase):
         self.assertEqual(self.net.dag.nodes[self.net.dag.end]["type"], "linear")
         self.assertFalse(self.net.dag.nodes[self.net.dag.end]["use_batch_norm"])
 
-    def test_growth_history_step(self) -> None:
-        self.net.growth_history_step(
-            neurons_added=[(self.net.dag.root, "1"), ("1", self.net.dag.end)],
-            # neurons_updated=[(self.net.dag.root, self.net.dag.end)],
-        )
-
-        for edge in self.net.dag.edges:
-            self.assertIn(str(edge), self.net.growth_history[self.net.global_step])
-        self.assertEqual(
-            self.net.growth_history[self.net.global_step][str((self.net.dag.root, "1"))],
-            2,
-        )
-        self.assertEqual(
-            self.net.growth_history[self.net.global_step][str(("1", self.net.dag.end))], 2
-        )
-        self.assertEqual(self.net.growth_history[self.net.global_step]["1"], 0)
-
-        self.net.growth_history_step(nodes_added=["1", "2"])
-        self.assertEqual(self.net.growth_history[self.net.global_step]["1"], 2)
-        self.assertNotIn("2", self.net.growth_history[self.net.global_step])
-
     def test_expand_node(self) -> None:
         node = "1"
         prev_nodes = self.net.dag.root
         next_nodes = self.net.dag.end
         expansion = Expansion(
             self.net.dag,
-            "new node",
+            ExpansionType.NEW_NODE,
             expanding_node=node,
             previous_node=prev_nodes,
             next_node=next_nodes,
@@ -190,7 +181,10 @@ class TestGrowingGraphNetwork(unittest.TestCase):
         prev_node = self.net.dag.root
         next_node = self.net.dag.end
         expansion = Expansion(
-            self.net.dag, "new edge", previous_node=prev_node, next_node=next_node
+            self.net.dag,
+            ExpansionType.NEW_EDGE,
+            previous_node=prev_node,
+            next_node=next_node,
         )
         expansion.dag.add_direct_edge(prev_node, next_node)
         edge_module = expansion.dag.get_edge_module(prev_node, next_node)
@@ -228,7 +222,10 @@ class TestGrowingGraphNetwork(unittest.TestCase):
         prev_node = self.net_conv.dag.root
         next_node = self.net_conv.dag.end
         expansion = Expansion(
-            self.net_conv.dag, "new edge", previous_node=prev_node, next_node=next_node
+            self.net_conv.dag,
+            ExpansionType.NEW_EDGE,
+            previous_node=prev_node,
+            next_node=next_node,
         )
         expansion.dag.add_direct_edge(
             prev_node, next_node, edge_attributes={"kernel_size": self.kernel_size}
@@ -286,7 +283,7 @@ class TestGrowingGraphNetwork(unittest.TestCase):
             torch.argmax(self.net(self.x), dim=1), num_classes=self.out_features
         )
         extended_pred = one_hot(
-            torch.argmax(self.net.extended_forward(self.x), dim=1),
+            torch.argmax(self.net.extended_forward(self.x)[0], dim=1),
             num_classes=self.out_features,
         )
 
@@ -310,16 +307,18 @@ class TestGrowingGraphNetwork(unittest.TestCase):
 
     @unittest_parametrize(({"evaluate": True}, {"evaluate": False}))
     def test_execute_expansions(self, evaluate: bool) -> None:
-        self.net.execute_expansions(
-            self.actions,
-            self.bottleneck,
-            self.input_B,
-            amplitude_factor=False,
-            evaluate=evaluate,
-            train_dataloader=self.dataloader,
-            dev_dataloader=self.dataloader,
-            val_dataloader=self.test_dataloader,
-        )
+        with self.assertWarns(UserWarning):
+            # Initializing zero-element tensors is a no-op
+            self.net.execute_expansions(
+                self.actions,
+                self.bottleneck,
+                self.input_B,
+                amplitude_factor=False,
+                evaluate=evaluate,
+                train_dataloader=self.dataloader,
+                dev_dataloader=self.dataloader,
+                val_dataloader=self.test_dataloader,
+            )
 
         for expansion in self.actions:
             if evaluate:
@@ -382,8 +381,16 @@ class TestGrowingGraphNetwork(unittest.TestCase):
 
     def test_restrict_action_space(self) -> None:
         self.assertEqual(len(self.actions), 4)
+        self.actions.append(
+            InterMergeExpansion(
+                self.net.dag,
+                exp_type=ExpansionType.EXPANDED_NODE,
+                expanding_node=self.net.dag.end,
+                adjacent_expanding_node="test",
+            )
+        )
 
-        # Not specifying chosen_inputs or chosen_outputs should raise a warning and return all actions
+        # Not specifing chosen_inputs or chosen_outputs should raise a warning and return all actions
         with self.assertWarns(UserWarning):
             gens = self.net.restrict_action_space(self.actions)
         self.assertListEqual(gens, self.actions)
@@ -392,7 +399,7 @@ class TestGrowingGraphNetwork(unittest.TestCase):
         gens = self.net.restrict_action_space(
             self.actions, chosen_outputs=[self.net.dag.end]
         )
-        self.assertEqual(len(gens), 3)
+        self.assertEqual(len(gens), 4)
 
         gens = self.net.restrict_action_space(self.actions, chosen_outputs=["1"])
         self.assertEqual(len(gens), 2)
@@ -417,15 +424,12 @@ class TestGrowingGraphNetwork(unittest.TestCase):
         self.assertEqual(len(gens), 3)
 
         gens = self.net.restrict_action_space(self.actions, chosen_inputs=["1"])
-        self.assertEqual(len(gens), 1)
+        self.assertEqual(len(gens), 2)
 
         gens = self.net.restrict_action_space(
             self.actions, chosen_inputs=[self.net.dag.end]
         )
         self.assertEqual(len(gens), 0)
-
-    def test_grow_step(self) -> None:
-        pass
 
     @unittest_parametrize(({"use_bic": True}, {"use_bic": False}))
     def test_choose_growth_best_option(self, use_bic: bool) -> None:
@@ -435,7 +439,10 @@ class TestGrowingGraphNetwork(unittest.TestCase):
 
         min_value = torch.inf
         for i, opt in enumerate(options):
-            opt.expand()
+            with self.assertMaybeWarns(
+                UserWarning, "Initializing zero-element tensors is a no-op"
+            ):
+                opt.expand()
             opt.growth_history = i
             opt.metrics["scaling_factor"] = 1
             opt.metrics["loss_train"] = None
@@ -455,24 +462,30 @@ class TestGrowingGraphNetwork(unittest.TestCase):
                     min_value = opt.metrics["loss_val"]
                     min_index = i
 
-        if options[min_index].type != "new edge":
+        if options[min_index].type != ExpansionType.NEW_EDGE:
             node_module = self.net.dag.get_node_module(options[min_index].expanding_node)
             for module in node_module.previous_modules:
                 weight = torch.rand(
                     (self.neurons, module.in_features), device=module.device
                 )
                 bias = torch.rand(self.neurons, device=module.device)
-                module.extended_output_layer = module.layer_of_tensor(
-                    weight=weight, bias=bias
-                )
+                with self.assertMaybeWarns(
+                    UserWarning, "Initializing zero-element tensors is a no-op"
+                ):
+                    module.extended_output_layer = module.layer_of_tensor(
+                        weight=weight, bias=bias
+                    )
             for module in node_module.next_modules:
                 weight = torch.rand(
                     (module.out_features, self.neurons), device=module.device
                 )
                 bias = torch.zeros(module.out_features, device=module.device)
-                module.extended_input_layer = module.layer_of_tensor(
-                    weight=weight, bias=bias
-                )
+                with self.assertMaybeWarns(
+                    UserWarning, "Initializing zero-element tensors is a no-op"
+                ):
+                    module.extended_input_layer = module.layer_of_tensor(
+                        weight=weight, bias=bias
+                    )
 
         self.net.choose_growth_best_action(options, use_bic=use_bic)
 
@@ -483,7 +496,7 @@ class TestGrowingGraphNetwork(unittest.TestCase):
             edge_module.optimal_delta_layer
             for edge_module in self.net.dag.get_all_edge_modules()
         )
-        if options[min_index].type != "new edge":
+        if options[min_index].type != ExpansionType.NEW_EDGE:
             self.assertIsNotNone(
                 edge_module.extended_output_layer
                 for edge_module in node_module.previous_modules
@@ -492,6 +505,193 @@ class TestGrowingGraphNetwork(unittest.TestCase):
                 edge_module.extended_input_layer
                 for edge_module in node_module.next_modules
             )
+
+    def test_clean_graph_with_chosen_action_and_apply_changes(self) -> None:
+        start, end = self.net_conv.dag.root, self.net_conv.dag.end
+        options = self.net_conv.dag.define_next_actions()
+        for opt in options:
+            opt.metrics["scaling_factor"] = 1
+            opt.expand()
+        self.assertIn("2@_a", self.net_conv.dag)
+        self.assertIn("2@_b", self.net_conv.dag)
+
+        # Expansion in the dag
+        self.net_conv.chosen_action = next(
+            opt for opt in options if opt.expanding_node == "2@_a"
+        )
+        self.net_conv.clean_graph_with_chosen_action(options)
+        self.net_conv.apply_change()
+        self.assertNotIn("2@_b", self.net_conv.dag.nodes)
+        self.assertNotIn((start, end), self.net_conv.dag.edges)
+        self.assertIsNone(
+            self.net_conv.dag.get_edge_module(start, "1").extended_output_layer
+        )
+        self.assertIsNone(
+            self.net_conv.dag.get_edge_module("1", end).extended_input_layer
+        )
+
+        # Expansion in non-related dag
+        self.net.chosen_action = self.net_conv.chosen_action
+        self.net.clean_graph_with_chosen_action(options)
+        self.net.apply_change()
+
+        # Expansion in the connection between the dags
+        self.net.delete_update()
+        self.net_conv.delete_update()
+        start_linear = self.net.dag.root
+        start_linear_module = self.net.dag.get_node_module(start_linear)
+        end_conv_module = self.net_conv.dag.get_node_module(end)
+        start_linear_module.in_features = 162
+        end_conv_module.add_next_module(start_linear_module)
+        start_linear_module.add_previous_module(end_conv_module)
+
+        options = self.net_conv.dag.define_next_actions(expand_end=True)
+        for opt in options:
+            opt.metrics["scaling_factor"] = 1
+            opt.expand()
+        self.net_conv.dag.get_edge_module("1", end).extended_output_layer = (
+            torch.nn.Conv2d(
+                in_channels=self.net_conv.neurons,
+                out_channels=1,
+                kernel_size=self.kernel_size,
+                device=self.net_conv.device,
+            )
+        )
+        self.net.dag.get_edge_module(start_linear, "1").extended_input_layer = (
+            torch.nn.Linear(
+                in_features=1,
+                out_features=self.net_conv.neurons,
+                bias=False,
+                device=self.net_conv.device,
+            )
+        )
+
+        # First dag
+        self.net_conv.chosen_action = next(
+            opt for opt in options if isinstance(opt, InterMergeExpansion)
+        )
+        self.net_conv.clean_graph_with_chosen_action(options)
+        self.assertIsNotNone(
+            self.net_conv.dag.get_edge_module("1", end).extended_output_layer
+        )
+        self.assertNotIn("2@_a", self.net_conv.dag.nodes)
+        self.assertNotIn("2@_b", self.net_conv.dag.nodes)
+        self.assertNotIn((start, end), self.net_conv.dag.edges)
+        self.assertIsNone(
+            self.net_conv.dag.get_edge_module(start, "1").extended_output_layer
+        )
+        self.assertIsNone(
+            self.net_conv.dag.get_edge_module("1", end).extended_input_layer
+        )
+        self.net_conv.apply_change()
+        self.assertEqual(end_conv_module.in_features, self.out_features + 1)
+
+        # Second dag
+        self.net.chosen_action = self.net_conv.chosen_action
+        self.net.clean_graph_with_chosen_action(options)
+        self.assertIsNotNone(
+            self.net.dag.get_edge_module(start_linear, "1").extended_input_layer
+        )
+        self.net.apply_change()
+        self.assertEqual(start_linear_module.in_features, self.out_features + 1)
+
+    def test_numeric_accuracy_when_expanding_around_pooling(self) -> None:
+        # import random
+        # torch.manual_seed(0)
+        # random.seed(0)
+        start_conv, end_conv = self.net_conv.dag.root, self.net_conv.dag.end
+        self.net_conv.dag.remove_node("1")
+        self.net_conv.dag.add_direct_edge(
+            start_conv, end_conv, edge_attributes={"kernel_size": self.kernel_size}
+        )
+        end_conv_module = self.net_conv.dag.get_node_module(end_conv)
+        end_conv_module.post_merge_function = torch.nn.Sequential(
+            torch.nn.SELU(),
+            torch.nn.AdaptiveAvgPool2d(output_size=1),
+        )
+        self.net_conv.neuron_lrate = 1e-2
+        self.net_conv.neuron_epochs = 2000
+
+        net_linear = GrowingGraphNetwork(
+            in_features=end_conv_module.out_channels,
+            out_features=self.out_features,
+            neurons=self.neurons,
+            loss_fn=torch.nn.CrossEntropyLoss(),
+            layer_type="linear",
+            name="lin",
+        )
+        start_linear, end_linear = net_linear.dag.root, net_linear.dag.end
+        net_linear.dag.add_direct_edge(start_linear, end_linear, zero_weights=True)
+        start_linear_module = net_linear.dag.get_node_module(start_linear)
+
+        end_conv_module.add_next_module(start_linear_module)
+        start_linear_module.add_previous_module(end_conv_module)
+
+        expansion = InterMergeExpansion(
+            dag=self.net_conv.dag,
+            exp_type=ExpansionType.EXPANDED_NODE,
+            expanding_node=end_conv,
+            adjacent_expanding_node=start_linear,
+        )
+
+        conv_guide = torch.nn.Conv2d(
+            self.in_features,
+            out_channels=self.neurons,
+            kernel_size=self.kernel_size,
+            padding="same",
+            device=global_device(),
+        )
+        lin_guide = torch.nn.Linear(
+            in_features=self.neurons,
+            out_features=self.out_features,
+            device=global_device(),
+        )
+        activation = torch.nn.SELU()
+        pooling = torch.nn.AdaptiveAvgPool2d(output_size=1)
+        flatten = torch.nn.Flatten()
+        model_guide = torch.nn.Sequential(
+            conv_guide,
+            activation,
+            pooling,
+            flatten,
+            lin_guide,
+        )
+
+        x = torch.rand(
+            (self.batch_size, self.in_features, *self.input_shape), device=global_device()
+        )
+        with torch.no_grad():
+            desired_output = model_guide(x)
+
+        bottleneck = {
+            end_linear: desired_output,
+        }
+        activity = {
+            start_conv: x,
+        }
+
+        self.net_conv.expand_node(
+            expansion=expansion,
+            bottlenecks=bottleneck,
+            activities=activity,
+            verbose=False,
+        )
+
+        layer_alpha = self.net_conv.dag.get_edge_module(
+            start_conv, end_conv
+        ).extended_output_layer
+        layer_omega = net_linear.dag.get_edge_module(
+            start_linear, end_linear
+        ).extended_input_layer
+        self.assertIsNotNone(layer_alpha)
+        self.assertIsNotNone(layer_alpha.weight)
+        self.assertIsNotNone(layer_alpha.bias)
+        self.assertIsNotNone(layer_omega)
+        self.assertIsNotNone(layer_omega.weight)
+        self.assertIsNone(layer_omega.bias)
+
+        output = layer_omega(flatten(pooling(activation(layer_alpha(x)))))
+        self.assertAllClose(desired_output, output, atol=1e-2)
 
 
 if __name__ == "__main__":

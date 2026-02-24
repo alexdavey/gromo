@@ -20,6 +20,17 @@ Develop branch
 Enhancements
 ~~~~~~~~~~~~
 
+- Improve flexibility in `growing_block` and `resnet` to allow creating more complex structures and to support more use cases (:gh:`194` by `Théo Rudkiewicz`_)
+- Change the behavior for negative scaling factor. Now use a positive scaling factor for the parameter update independently of the sign of the scaling factor. (:gh:`195` by `Théo Rudkiewicz`_)
+- Fix a convergence problem in `sqrt_inverse_matrix_semi_positive` (:gh:`192` by `Théo Rudkiewicz`_)
+- Added documentation linting in CI/CD and reduced warnings in tests (:gh:`158` by `Stella Douka`_)
+- New tutorial for `GrowingContainer` (:gh:`188` by `Théo Rudkiewicz`_)
+- Update `GrowingBlock` to include recently added features in `GrowingModule` such as `in_neurons` property, `target_in_neurons` parameter, and methods for multi-step growth processes (:gh:`186` by `Théo Rudkiewicz`_)
+- Add `in_neurons` property and `target_in_neurons` parameter to `GrowingModule`, `LinearGrowingModule`, and `Conv2dGrowingModule` for tracking neuron counts during growth. Add `missing_neurons`, `number_of_neurons_to_add`, and `complete_growth` methods to simplify multi-step growth processes (:gh:`187` by `Théo Rudkiewicz`_)
+- Add new normalization methods (:gh:`185` by `Théo Rudkiewicz`_)
+- Update `output_volume` in `Conv2dMergeGrowingModule` based on post_merge_function and reshaping (:gh:`177` by `Stella Douka`_)
+- Implement lazy loading datasets that read directly from the disk (:gh:`169` by `Stella Douka`_)
+- Modify `in_channels` and `out_channels` as properties in `Conv2dGrowingModule` (:gh:`174` by `Stella Douka`_)
 - Introduce a `SequentialGrowingContainer` structure specialized for container with sequential layers.  Introduce a `ResNetBasicBlock` class to create resnet 18/34 like structure with growable blocks and the possibility of adding blocks. (:gh:`168` by `Théo Rudkiewicz`_)
 - Allow to create layer extension with different simple initialization (different random and zero). (:gh:`165` by `Théo Rudkiewicz`_)
 - Add `TensorStatisticWithEstimationError` and corresponding class `TestTensorStatisticWithEstimationError`. It computes an estimation of the quadratic error done when estimating the given tensor statistic. Modify `TensorStatistic` so that there is no need to call init (:gh:`149` by `Félix Houdouin`_).
@@ -72,6 +83,8 @@ Enhancements
 Bugs
 ~~~~
 
+- Fix sub-modules that are not registered in pytorch (:gh:`179` by `Stella Douka`_)
+- Fix persistent value of input volume (:gh:`174` by `Stella Douka`_)
 - Fix memory leak in tensor updates (:gh:`138` by `Stella Douka`_)
 - Device handling in GrowingMLP, GrowingMLPMixer, and GrowingResidualMLP (:gh:`129` by `Stella Douka`_)
 - Delete leftover activity tensors (:gh:`78` & `100` by `Stella Douka`_)
@@ -91,7 +104,7 @@ Bugs
 API changes
 ~~~~~~~~~~~
 
-- Allow growth between two `GrowingDAG` modules (:gh:`148` by `Stella Douka`_)
+- Allow growth between two `GrowingDAG` modules (:gh:`148` & :gh:`179` by `Stella Douka`_)
 - Apply all candidate expansions on the same `GrowingDAG` without deepcopy (:gh:`148` by `Stella Douka`_)
 - Moved `compute_optimal_delta` function from LinearMergeGrowingModuke to MergeGrowingModule (:gh:`94` by `Stella Douka`_)
 - Renamed AdditionGrowingModule to MergeGrowingModule for clarity (:gh:`84` by `Stella Douka`_)
