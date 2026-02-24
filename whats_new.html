@@ -48,8 +48,8 @@
     <script src="_static/jquery.js?v=5d32c60e"></script>
     <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
     <script src="_static/documentation_options.js?v=5baf466d"></script>
-    <script src="_static/doctools.js?v=9bcbadda"></script>
-    <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="_static/doctools.js?v=fd6eb6e6"></script>
+    <script src="_static/sphinx_highlight.js?v=6ffebe34"></script>
     <script src="_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="_static/copybutton.js?v=f281be69"></script>
     <script src="_static/design-tabs.js?v=f930bc37"></script>
@@ -369,6 +369,14 @@
 <section id="enhancements">
 <h3>Enhancements<a class="headerlink" href="#enhancements" title="Link to this heading">#</a></h3>
 <ul class="simple">
+<li><p>Improve flexibility in <cite>growing_block</cite> and <cite>resnet</cite> to allow creating more complex structures and to support more use cases (<a class="reference external" href="https://github.com/growingnet/gromo/issues/194">#194</a> by <a class="reference external" href="https://github.com/TheoRudkiewicz">Théo Rudkiewicz</a>)</p></li>
+<li><p>Change the behavior for negative scaling factor. Now use a positive scaling factor for the parameter update independently of the sign of the scaling factor. (<a class="reference external" href="https://github.com/growingnet/gromo/issues/195">#195</a> by <a class="reference external" href="https://github.com/TheoRudkiewicz">Théo Rudkiewicz</a>)</p></li>
+<li><p>Fix a convergence problem in <cite>sqrt_inverse_matrix_semi_positive</cite> (<a class="reference external" href="https://github.com/growingnet/gromo/issues/192">#192</a> by <a class="reference external" href="https://github.com/TheoRudkiewicz">Théo Rudkiewicz</a>)</p></li>
+<li><p>Added documentation linting in CI/CD and reduced warnings in tests (<a class="reference external" href="https://github.com/growingnet/gromo/issues/158">#158</a> by <a class="reference external" href="https://github.com/stelladk">Stella Douka</a>)</p></li>
+<li><p>New tutorial for <cite>GrowingContainer</cite> (<a class="reference external" href="https://github.com/growingnet/gromo/issues/188">#188</a> by <a class="reference external" href="https://github.com/TheoRudkiewicz">Théo Rudkiewicz</a>)</p></li>
+<li><p>Update <cite>GrowingBlock</cite> to include recently added features in <cite>GrowingModule</cite> such as <cite>in_neurons</cite> property, <cite>target_in_neurons</cite> parameter, and methods for multi-step growth processes (<a class="reference external" href="https://github.com/growingnet/gromo/issues/186">#186</a> by <a class="reference external" href="https://github.com/TheoRudkiewicz">Théo Rudkiewicz</a>)</p></li>
+<li><p>Add <cite>in_neurons</cite> property and <cite>target_in_neurons</cite> parameter to <cite>GrowingModule</cite>, <cite>LinearGrowingModule</cite>, and <cite>Conv2dGrowingModule</cite> for tracking neuron counts during growth. Add <cite>missing_neurons</cite>, <cite>number_of_neurons_to_add</cite>, and <cite>complete_growth</cite> methods to simplify multi-step growth processes (<a class="reference external" href="https://github.com/growingnet/gromo/issues/187">#187</a> by <a class="reference external" href="https://github.com/TheoRudkiewicz">Théo Rudkiewicz</a>)</p></li>
+<li><p>Add new normalization methods (<a class="reference external" href="https://github.com/growingnet/gromo/issues/185">#185</a> by <a class="reference external" href="https://github.com/TheoRudkiewicz">Théo Rudkiewicz</a>)</p></li>
 <li><p>Update <cite>output_volume</cite> in <cite>Conv2dMergeGrowingModule</cite> based on post_merge_function and reshaping (<a class="reference external" href="https://github.com/growingnet/gromo/issues/177">#177</a> by <a class="reference external" href="https://github.com/stelladk">Stella Douka</a>)</p></li>
 <li><p>Implement lazy loading datasets that read directly from the disk (<a class="reference external" href="https://github.com/growingnet/gromo/issues/169">#169</a> by <a class="reference external" href="https://github.com/stelladk">Stella Douka</a>)</p></li>
 <li><p>Modify <cite>in_channels</cite> and <cite>out_channels</cite> as properties in <cite>Conv2dGrowingModule</cite> (<a class="reference external" href="https://github.com/growingnet/gromo/issues/174">#174</a> by <a class="reference external" href="https://github.com/stelladk">Stella Douka</a>)</p></li>
@@ -538,7 +546,7 @@
 
   <p class="copyright">
     
-      © Copyright 2024-2025 GroMo contributors.
+      © Copyright 2024-2026 GroMo contributors.
       <br/>
     
   </p>
