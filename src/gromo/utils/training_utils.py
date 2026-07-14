@@ -1,5 +1,7 @@
-from collections.abc import Callable, Generator
-from typing import Any, Literal
+from collections.abc import Callable, Generator, Mapping
+from contextlib import contextmanager
+from typing import Any, Iterator, Literal
+from warnings import warn
 
 import torch
 import torch.utils.data
@@ -7,6 +9,14 @@ from torch import nn
 from torchmetrics import Metric, classification
 
 from gromo.containers.growing_container import GrowingContainer, GrowingModel
+from gromo.modules.constant_module import ConstantModule
+from gromo.modules.growing_module import GrowingModule, MergeGrowingModule
+from gromo.utils.fixed_point import (
+    FixedPointConfig,
+    FixedPointUpdateResult,
+    TensorMap,
+    _solve_fixed_point,
+)
 from gromo.utils.utils import global_device
 
 
@@ -324,6 +334,47 @@ def gradient_descent(
     return loss_meter.compute().item(), metrics.compute().item()
 
 
+def _compute_statistics_pass(
+    model: GrowingContainer,
+    dataloader: torch.utils.data.DataLoader,
+    loss_function: nn.Module,
+    metrics: Metric | None = None,
+    batch_limit: int | None = None,
+    dataloader_seed: int | None = None,
+    device: torch.device = torch.device("cpu"),
+    check_finite: bool = False,
+) -> tuple[float, float]:
+    """Run one complete statistics pass.
+
+    This helper preserves the behavior of :func:`compute_statistics` while allowing
+    the fixed-point workflow to reject non-finite losses before backward propagation.
+    """
+    loss_meter = AverageMeter()
+    if metrics is None:
+        metrics = DummyMetric()
+    else:
+        metrics.reset()
+        metrics = metrics.to(device)
+
+    model.init_computation()
+    model.eval()
+    for _, (x, y) in enumerate_dataloader(
+        dataloader, dataloader_seed=dataloader_seed, batch_limit=batch_limit
+    ):
+        model.zero_grad()
+        x, y = x.to(device), y.to(device)
+        y_pred = model(x)
+        loss = loss_function(y_pred, y)
+        if check_finite and not torch.isfinite(loss).all().item():
+            raise FloatingPointError("statistics pass produced a non-finite loss")
+        loss.backward()
+        model.update_computation()
+        loss_meter.update(loss.detach() / x.size(0), x.size(0))
+        metrics.update(y_pred.detach(), y)
+
+    return loss_meter.compute().item(), metrics.compute().item()
+
+
 def compute_statistics(
     model: GrowingContainer,
     dataloader: torch.utils.data.DataLoader,
@@ -333,9 +384,7 @@ def compute_statistics(
     dataloader_seed: int | None = None,
     device: torch.device = torch.device("cpu"),
 ) -> tuple[float, float]:
-    """
-    Compute the tensor of statistics of the model on the dataloader
-    with a limit of batch_limit batches.
+    """Compute tensor statistics of the model over a dataloader.
 
     Parameters
     ----------
@@ -365,28 +414,317 @@ def compute_statistics(
     assert not isinstance(loss_function, nn.Module) or loss_function.reduction == "sum", (
         "The loss function should not be averaged over the batch"
     )
-    loss_meter = AverageMeter()
-    if metrics is None:
-        metrics = DummyMetric()
-    else:
-        metrics.reset()
-        metrics = metrics.to(device)
+    return _compute_statistics_pass(
+        model=model,
+        dataloader=dataloader,
+        loss_function=loss_function,
+        metrics=metrics,
+        batch_limit=batch_limit,
+        dataloader_seed=dataloader_seed,
+        device=device,
+    )
 
-    model.init_computation()
-    model.eval()
-    for _, (x, y) in enumerate_dataloader(
-        dataloader, dataloader_seed=dataloader_seed, batch_limit=batch_limit
-    ):
-        model.zero_grad()
-        x, y = x.to(device), y.to(device)
-        y_pred = model(x)
-        loss = loss_function(y_pred, y)
-        loss.backward()
-        model.update_computation()
-        loss_meter.update(loss.detach() / x.size(0), x.size(0))
-        metrics.update(y_pred.detach(), y)
 
-    return loss_meter.compute().item(), metrics.compute().item()
+def _raw_optimal_delta(module: GrowingModule) -> torch.nn.Module | None:
+    """Return the stored delta module without invoking specialized properties."""
+    key = (
+        "_hidden_optimal_delta_layer"
+        if isinstance(module, ConstantModule)
+        else "optimal_delta_layer"
+    )
+    return module._modules.get(key)
+
+
+def _has_pending_growth_update(model: GrowingContainer) -> bool:
+    """Return whether the model already contains a proposed growth update."""
+    for module in model.modules():
+        if not isinstance(module, GrowingModule):
+            continue
+        if _raw_optimal_delta(module) is not None:
+            return True
+        if module.extended_input_layer is not None:
+            return True
+        if module.extended_output_layer is not None:
+            return True
+    return False
+
+
+def _collect_optimal_deltas(
+    model: GrowingContainer,
+) -> tuple[TensorMap, dict[str, GrowingModule]]:
+    """Collect nonempty active weight and bias deltas by stable module path."""
+    updates: TensorMap = {}
+    modules: dict[str, GrowingModule] = {}
+    for name, module in model.named_modules():
+        if not isinstance(module, GrowingModule) or isinstance(module, ConstantModule):
+            continue
+        delta_layer = _raw_optimal_delta(module)
+        if delta_layer is None:
+            continue
+        found_parameter = False
+        delta_weight = getattr(delta_layer, "weight", None)
+        if isinstance(delta_weight, torch.Tensor) and delta_weight.numel() > 0:
+            updates[f"{name}.weight"] = delta_weight.detach().clone()
+            found_parameter = True
+        delta_bias = getattr(delta_layer, "bias", None)
+        if isinstance(delta_bias, torch.Tensor) and delta_bias.numel() > 0:
+            updates[f"{name}.bias"] = delta_bias.detach().clone()
+            found_parameter = True
+        if found_parameter:
+            modules[name] = module
+    return updates, modules
+
+
+def _capture_base_parameters(
+    updates: Mapping[str, torch.Tensor],
+    modules: Mapping[str, GrowingModule],
+) -> TensorMap:
+    """Clone the base parameters corresponding to a fixed-point update map."""
+    base: TensorMap = {}
+    for key, update in updates.items():
+        module_name, parameter_name = key.rsplit(".", 1)
+        module = modules[module_name]
+        parameter = getattr(module.layer, parameter_name, None)
+        if not isinstance(parameter, torch.Tensor):
+            raise RuntimeError(f"{key} does not identify a tensor parameter")
+        if parameter.shape != update.shape:
+            raise RuntimeError(
+                f"the update for {key} has shape {tuple(update.shape)}, "
+                f"but the parameter has shape {tuple(parameter.shape)}"
+            )
+        base[key] = parameter.detach().clone()
+    return base
+
+
+@contextmanager
+def _temporary_fixed_point_candidate(
+    candidate: Mapping[str, torch.Tensor] | None,
+    base: Mapping[str, torch.Tensor],
+    modules: Mapping[str, GrowingModule],
+) -> Iterator[None]:
+    """Temporarily install ``W - D`` and always restore immutable base values."""
+    if candidate is None:
+        yield
+        return
+
+    try:
+        with torch.no_grad():
+            for key, update in candidate.items():
+                module_name, parameter_name = key.rsplit(".", 1)
+                parameter = getattr(modules[module_name].layer, parameter_name)
+                parameter.copy_(base[key] - update)
+        yield
+    finally:
+        with torch.no_grad():
+            for key, value in base.items():
+                module_name, parameter_name = key.rsplit(".", 1)
+                parameter = getattr(modules[module_name].layer, parameter_name)
+                parameter.copy_(value)
+
+
+def _clear_growth_updates(model: GrowingContainer) -> None:
+    """Clear partial proposals after a failed high-level growth computation."""
+    for module in model.modules():
+        if isinstance(module, GrowingModule):
+            module.optimal_delta_layer = None
+            module.extended_input_layer = None
+            module.extended_output_layer = None
+            module.parameter_update_decrease = None
+            module.eigenvalues_extension = None
+            module.delta_raw = None
+        elif isinstance(module, MergeGrowingModule) and hasattr(
+            module, "parameter_update_decrease"
+        ):
+            module.parameter_update_decrease = None
+
+
+def _restore_parameter_gradients(
+    gradients: Mapping[torch.nn.Parameter, torch.Tensor | None],
+) -> None:
+    """Restore parameter gradients captured before statistics computation."""
+    for parameter, gradient in gradients.items():
+        parameter.grad = None if gradient is None else gradient.detach().clone()
+
+
+def compute_fixed_point_updates(
+    model: GrowingContainer,
+    dataloader: torch.utils.data.DataLoader,
+    loss_function: nn.Module,
+    *,
+    fixed_point_config: FixedPointConfig | None = None,
+    metrics: Metric | None = None,
+    batch_limit: int | None = None,
+    dataloader_seed: int | None = None,
+    device: torch.device = torch.device("cpu"),
+    optimal_update_kwargs: Mapping[str, Any] | None = None,
+) -> FixedPointUpdateResult:
+    """Compute a complete growth proposal, optionally at an endpoint fixed point.
+
+    Fixed-point mode solves the joint equation ``D = T(D)`` over the optimal weight
+    and bias deltas produced for all active growing layers. Gromo subtracts stored
+    deltas when applying them, so each map evaluation recomputes all statistics at
+    ``W - D``. Every iteration is therefore a complete dataloader pass.
+
+    The utility restores base parameters, parameter gradients, model mode, and the
+    available PyTorch and dataloader RNG states. The final optimal deltas and neuron
+    extensions remain installed as proposals; this function never calls
+    :meth:`GrowingContainer.apply_change`.
+
+    Deterministic maps require a deterministic dataloader or ``dataloader_seed``.
+    Persistent workers and random transforms using external RNGs cannot be fully
+    controlled by the state snapshots performed here.
+
+    Parameters
+    ----------
+    model: GrowingContainer
+        Model whose active growing layers should receive proposals.
+    dataloader: torch.utils.data.DataLoader
+        Data used to recompute gradient statistics on every map evaluation.
+    loss_function: nn.Module
+        Loss with ``reduction="sum"``.
+    fixed_point_config: FixedPointConfig | None
+        Solver configuration, or ``None`` for the existing one-pass behavior.
+    metrics: Metric | None
+        Optional metric evaluated on the terminal statistics pass.
+    batch_limit: int | None
+        Optional number of batches per statistics pass.
+    dataloader_seed: int | None
+        Seed used to replay a dataloader with a generator.
+    device: torch.device
+        Device to which inputs and targets are moved.
+    optimal_update_kwargs: Mapping[str, Any] | None
+        Options forwarded unchanged to ``model.compute_optimal_updates``.
+
+    Returns
+    -------
+    FixedPointUpdateResult
+        Terminal loss, metric, and optional fixed-point diagnostics.
+
+    Raises
+    ------
+    RuntimeError
+        If a proposal is already pending or the active update set changes.
+    ValueError
+        If fixed-point mode is requested while optimal deltas are disabled.
+    FloatingPointError
+        If a map evaluation produces a non-finite loss or update.
+    """
+    assert not isinstance(loss_function, nn.Module) or loss_function.reduction == "sum", (
+        "The loss function should not be averaged over the batch"
+    )
+    kwargs = dict(optimal_update_kwargs or {})
+    if fixed_point_config is not None and kwargs.get("compute_delta", True) is False:
+        raise ValueError("fixed-point mode requires compute_delta=True")
+    if _has_pending_growth_update(model):
+        raise RuntimeError(
+            "compute_fixed_point_updates requires a model without a pending growth proposal"
+        )
+
+    original_training = model.training
+    original_gradients = {
+        parameter: (None if parameter.grad is None else parameter.grad.detach().clone())
+        for parameter in model.parameters()
+    }
+    cpu_rng_state = torch.get_rng_state()
+    cuda_rng_states = (
+        torch.cuda.get_rng_state_all() if torch.cuda.is_initialized() else None
+    )
+    generator = getattr(dataloader, "generator", None)
+    generator_state = (
+        generator.get_state() if isinstance(generator, torch.Generator) else None
+    )
+
+    def reset_iteration_rng() -> None:
+        """Replay model-side and dataloader-side randomness for every map call."""
+        torch.set_rng_state(cpu_rng_state)
+        if cuda_rng_states is not None:
+            torch.cuda.set_rng_state_all(cuda_rng_states)
+        if generator_state is not None:
+            generator.set_state(generator_state)
+
+    try:
+        if fixed_point_config is None:
+            reset_iteration_rng()
+            loss, metric = _compute_statistics_pass(
+                model=model,
+                dataloader=dataloader,
+                loss_function=loss_function,
+                metrics=metrics,
+                batch_limit=batch_limit,
+                dataloader_seed=dataloader_seed,
+                device=device,
+                check_finite=True,
+            )
+            model.compute_optimal_updates(**kwargs)
+            result = FixedPointUpdateResult(loss=loss, metric=metric, fixed_point=None)
+        else:
+            base_parameters: TensorMap = {}
+            target_modules: dict[str, GrowingModule] = {}
+            latest_metric = 0.0
+
+            def evaluate_map(candidate: TensorMap | None) -> tuple[TensorMap, float]:
+                nonlocal base_parameters, target_modules, latest_metric
+                reset_iteration_rng()
+                with _temporary_fixed_point_candidate(
+                    candidate,
+                    base_parameters,
+                    target_modules,
+                ):
+                    loss, latest_metric = _compute_statistics_pass(
+                        model=model,
+                        dataloader=dataloader,
+                        loss_function=loss_function,
+                        metrics=metrics,
+                        batch_limit=batch_limit,
+                        dataloader_seed=dataloader_seed,
+                        device=device,
+                        check_finite=True,
+                    )
+                    model.compute_optimal_updates(**kwargs)
+                    updates, discovered_modules = _collect_optimal_deltas(model)
+                    if candidate is None:
+                        target_modules = discovered_modules
+                        base_parameters = _capture_base_parameters(
+                            updates,
+                            target_modules,
+                        )
+                    return updates, loss
+
+            solution = _solve_fixed_point(evaluate_map, fixed_point_config)
+            terminal = solution.result.history[-1]
+            result = FixedPointUpdateResult(
+                loss=terminal.loss,
+                metric=latest_metric,
+                fixed_point=solution.result,
+            )
+
+        model.reset_computation()
+        return result
+    except Exception:
+        try:
+            model.reset_computation()
+        except (
+            AssertionError,
+            AttributeError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as reset_error:
+            warn(
+                f"Failed to reset growth statistics after an error: {reset_error}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        _clear_growth_updates(model)
+        raise
+    finally:
+        model.train(original_training)
+        _restore_parameter_gradients(original_gradients)
+        torch.set_rng_state(cpu_rng_state)
+        if cuda_rng_states is not None:
+            torch.cuda.set_rng_state_all(cuda_rng_states)
+        if generator_state is not None:
+            generator.set_state(generator_state)
 
 
 # backward compatibility
